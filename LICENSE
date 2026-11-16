@@ -1,0 +1,56 @@
+GNU GENERAL PUBLIC LICENSE
+Version 3, 29 June 2007
+
+OptiScaler 简体中文汉化（OptiScaler-zhcn）
+==========================================
+
+本仓库（脚本、GitHub Actions 工作流、字典与文档）以 GNU General Public
+License 第 3 版（GPL-3.0）发布。
+
+    Copyright (C) 2026 OptiScaler-zhcn contributors
+
+    This program is free software: you can redistribute it and/or modify
+    it under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    This program is distributed in the hope that it will be useful,
+    but WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+    GNU General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+GPL-3.0 全文
+------------
+
+许可证完整正文不在此处重复，请以官方发布为准：
+
+  * 英文（权威版本）：https://www.gnu.org/licenses/gpl-3.0.txt
+  * 中文非官方译本（仅供参考，不具法律效力）：https://www.gnu.org/licenses/gpl-3.0.zh-cn.html
+
+构建产物
+--------
+
+本仓库产出的 `OptiScaler.dll` 是 [OptiScaler](https://github.com/optiscaler/OptiScaler)
+源码的衍生作品。OptiScaler 本身以 GPL-3.0 发布，**其版权归 OptiScaler 上游作者所有**。
+
+因此：
+
+  * 产物同样以 GPL-3.0 发布，而不是本仓库另行授权。
+  * 本仓库只提供汉化补丁（源码替换 + 字体注入 + 编译打包），
+    **不主张对上游作品的任何额外权利，也不改变上游的许可条件**。
+  * 按 GPL-3.0 第 6 条（对应源码的提供义务），本仓库的每个 Release
+    都同时附带构建所用上游 commit 的完整源码快照 `corresponding-source.zip`
+    与子模块版本清单 `submodules.txt`。
+
+第三方组件
+----------
+
+  * OptiScaler —— GPL-3.0，https://github.com/optiscaler/OptiScaler
+  * 内嵌中文字体子集 —— 取自 Microsoft YaHei（微软雅黑）。
+    本仓库与 Release 均不分发字体文件本身；详见 README 的「字体许可提示」。
+  * 字体子集化使用 fontTools —— MIT License，https://github.com/fonttools/fonttools
+
+本文件是 GPL-3.0 的说明与声明，不替代许可证全文。

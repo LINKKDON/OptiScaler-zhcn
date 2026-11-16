@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Upstream checkout: the build pulls optiscaler/OptiScaler into ./src at CI
+# time. Never commit a copy of the upstream sources here.
+OptiScaler/
+src/
+external/
+
+# Build output
+x64/
+Release/
+Debug/
+dist/
+*.dll
+*.pdb
+*.exp
+*.lib
+*.ilk
+
+# Release payloads
+*.7z
+*.zip
+
+# Font sources: never commit the original Microsoft YaHei .ttc (large, and its
+# licence does not travel with the file). The ~551 KB 920-codepoint *subset*
+# tools_cn/msyh_cjk.ttf IS committed on purpose: it is the first fallback level
+# in tools_cn/build_font.py, because windows-latest is not guaranteed to ship an
+# East Asian font pack. Do not add a rule that ignores it. See README.
+*.ttc
+*.otf
+
+# Editor / OS noise
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Local scratch: extraction batches and the translated ini used to eyeball the
+# dictionary. Nothing here is needed by a build.
+_ini/
+_probe/
+# Local verification workspace: probe fixtures plus copies of upstream sources
+# and generated CJK headers (several MB). Never part of the repository.
+verify/

@@ -1,0 +1,539 @@
+name: Build Chinese (Auto)
+
+# Thin-repo build.
+#
+# This repository only holds the localization tooling and the workflows. The
+# upstream sources are checked out into ./src at build time, localized in place,
+# compiled, and only the resulting OptiScaler.dll plus the comment-localized
+# OptiScaler.ini are published as a Release asset.
+#
+# NOTE: there is deliberately no `push:` trigger. Editing a document or a
+# dictionary entry should not start a 90 minute compile; the schedule slot below
+# checks whether upstream actually moved and exits early when it did not.
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Rebuild even if this upstream commit was already released'
+        type: boolean
+        default: false
+  schedule:
+    # Daily check whether upstream moved; the job exits early when it did not.
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-zhcn
+  cancel-in-progress: false
+
+env:
+  SOLUTION_FILE_PATH: src/OptiScaler.sln
+  BUILD_CONFIGURATION: Release
+  UPSTREAM_REPOSITORY: optiscaler/OptiScaler
+  UPSTREAM_REF: master
+  # Three level font fallback, implemented in tools_cn/build_font.py:
+  #   tools_cn/msyh_cjk.ttf  ->  C:\Windows\Fonts\msyh.ttc  ->  hard error
+  # The font step only passes --source when WINDOWS_FONT actually exists on the
+  # runner; otherwise it lets the script walk the chain itself, which prefers
+  # the committed tools_cn/msyh_cjk.ttf and fails loudly with the
+  # "commit the 551 KB subset" hint if that is missing too.
+  WINDOWS_FONT: C:\Windows\Fonts\msyh.ttc
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout this repository (tooling)
+        uses: actions/checkout@v4
+        with:
+          path: self
+          fetch-depth: 1
+
+      # No actions/cache here on purpose. Restoring src/.git/modules before the
+      # checkout looks like it would save the ~1.49 GB submodule fetch, but
+      # actions/checkout's prepareExistingDirectory() deletes everything under
+      # the target path whenever repo/.git exists without a usable
+      # remote.origin.url -- and the cached modules/ directory carries no
+      # .git/config, so the just-restored objects are always thrown away again.
+      # A run-scoped key never produces an exact hit, so the post-job save
+      # would upload the full object store on every run and never reuse it.
+      # Caching it properly needs `submodules: false` plus an explicit
+      # `git submodule update --init --recursive`, which adds a new failure
+      # mode that can only be validated on a real runner. Not worth it yet.
+      - name: Checkout upstream sources
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPOSITORY }}
+          ref: ${{ env.UPSTREAM_REF }}
+          path: src
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Resolve upstream revision
+        id: upstream
+        shell: pwsh
+        run: |
+          $sha = (git -C src rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($sha)) {
+            Write-Host "::error::could not resolve the upstream commit"
+            exit 1
+          }
+          $describe = (git -C src describe --tags --always).Trim()
+          if ([string]::IsNullOrWhiteSpace($describe)) { $describe = "unknown" }
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          "describe=$describe" >> $env:GITHUB_OUTPUT
+          Write-Host "upstream sha      : $sha"
+          Write-Host "upstream describe : $describe"
+
+      - name: Skip when this upstream commit is already released
+        id: check
+        shell: pwsh
+        env:
+          GH_REPO: ${{ github.repository }}
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          $skip = "false"
+          if ($env:FORCE -eq "true") {
+            Write-Host "force was requested, building anyway"
+          }
+          else {
+            $marker = "upstream-sha: $env:UPSTREAM_SHA"
+            $found = ""
+            # GH_REPO pins gh to this repository: the workspace holds two git
+            # checkouts (self/ and src/) and gh would otherwise guess wrong.
+            $raw = gh release list --limit 30 --json tagName,body 2>$null
+            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($raw)) {
+              $releases = $raw | ConvertFrom-Json
+              # The tag prefix is deliberately specific: a plain "zh-cn-*" would
+              # also match the "zh-cn-signed-*" tags, so publishing a signed
+              # build would make this unsigned workflow skip the same commit.
+              foreach ($rel in $releases) {
+                if ($null -ne $rel.body -and $rel.body -like "*$marker*" -and $rel.tagName -like "zh-cn-OptiScaler_*") {
+                  $found = $rel.tagName
+                  break
+                }
+              }
+            }
+            if ($found) {
+              $skip = "true"
+              Write-Host "upstream $env:UPSTREAM_SHA is already published as $found"
+              $summary = @(
+                "## Skipped: upstream unchanged",
+                "",
+                "Upstream commit $env:UPSTREAM_SHA is already published in release $found.",
+                "",
+                "Nothing was rebuilt. Re-run this workflow with **force** enabled to rebuild anyway."
+              )
+              Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary -Encoding utf8
+            }
+            else {
+              Write-Host "no release yet for upstream $env:UPSTREAM_SHA"
+            }
+          }
+          "skip=$skip" >> $env:GITHUB_OUTPUT
+
+      - name: Set up Python
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install font tooling
+        if: steps.check.outputs.skip != 'true'
+        run: python -m pip install --disable-pip-version-check fonttools
+
+      - name: Generate the embedded CJK font header
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          # build_font.py resolves its own font source: bundled
+          # tools_cn/msyh_cjk.ttf first, then the system file, then a hard error
+          # telling the maintainer to commit the 551 KB subset. WINDOWS_FONT is
+          # only passed along when it actually exists on the runner, so the
+          # tool's own fallback chain stays in charge.
+          $fontArgs = @('--out', 'src/OptiScaler/menu/font', '--dict', 'self/tools_cn/dict_v10.json')
+          if ($env:WINDOWS_FONT -and (Test-Path -LiteralPath $env:WINDOWS_FONT)) {
+            Write-Host "using system font $env:WINDOWS_FONT"
+            $fontArgs += @('--source', $env:WINDOWS_FONT)
+          }
+          else {
+            Write-Host "system font not present, letting build_font.py fall back"
+          }
+          python self/tools_cn/build_font.py @fontArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Inject the Chinese translations and the font merge block
+        if: steps.check.outputs.skip != 'true'
+        run: >-
+          python self/tools_cn/localize.py
+          --repo src
+          --tools self/tools_cn
+
+      - name: Localize the OptiScaler.ini comments
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          python self/tools_cn/localize_ini.py --ini src/OptiScaler.ini --dict self/tools_cn/dict_ini.json --out src/OptiScaler.ini --report
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python self/tools_cn/localize_ini.py --ini src/OptiScaler.ini --dict self/tools_cn/dict_ini.json --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Add MSBuild to PATH
+        if: steps.check.outputs.skip != 'true'
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Compile
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          msbuild $env:SOLUTION_FILE_PATH /m /p:Configuration=$env:BUILD_CONFIGURATION /verbosity:minimal
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify the build output
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          # The vcxproj PostBuildEvent moves the dll into x64\Release\a\ and
+          # copies OptiScaler.ini next to it, so both are already in place.
+          $ok = $true
+          foreach ($f in @("src/x64/Release/a/OptiScaler.dll", "src/x64/Release/a/OptiScaler.ini")) {
+            if (Test-Path $f) {
+              Write-Host ("{0}  {1} bytes" -f $f, (Get-Item $f).Length)
+            }
+            else {
+              Write-Host "::error::missing build output $f"
+              $ok = $false
+            }
+          }
+          if (-not $ok) {
+            Get-ChildItem -Path src/x64 -Recurse -File -ErrorAction SilentlyContinue |
+              Select-Object -First 40 FullName | Format-Table -AutoSize | Out-String | Write-Host
+            exit 1
+          }
+
+      - name: Derive the version and the asset names
+        id: version
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          UPSTREAM_DESCRIBE: ${{ steps.upstream.outputs.describe }}
+        run: |
+          $defines = @{}
+          $names = @("VER_MAJOR_VERSION", "VER_MINOR_VERSION", "VER_HOTFIX_VERSION", "VER_BUILD_NUMBER")
+          $candidates = @(
+            "src/OptiScaler/resource.h",
+            "src/OptiScaler/version.h",
+            "src/OptiScaler/OptiScaler.h",
+            "src/OptiScaler/menu/menu_common.h"
+          )
+          foreach ($c in $candidates) {
+            if ($defines.Count -eq $names.Count) { break }
+            if (-not (Test-Path -LiteralPath $c)) { continue }
+            $text = Get-Content -LiteralPath $c -Raw
+            if ([string]::IsNullOrEmpty($text)) { continue }
+            foreach ($n in $names) {
+              if (-not $defines.ContainsKey($n)) {
+                $m = [regex]::Match($text, "#define\s+$n\s+(\d+)")
+                if ($m.Success) {
+                  $defines[$n] = $m.Groups[1].Value
+                  Write-Host "  $n = $($m.Groups[1].Value)  ($c)"
+                }
+              }
+            }
+          }
+
+          if ($defines.Count -eq $names.Count) {
+            $version = "v$($defines['VER_MAJOR_VERSION']).$($defines['VER_MINOR_VERSION']).$($defines['VER_HOTFIX_VERSION'])-pre$($defines['VER_BUILD_NUMBER'])"
+            Write-Host "version taken from the source macros"
+          }
+          else {
+            # An older or normalized upstream snapshot does not always carry the
+            # four macros. Never fail the build over the file name: fall back to
+            # git describe and keep going.
+            $missing = ($names | Where-Object { -not $defines.ContainsKey($_) }) -join ", "
+            Write-Host "::warning::version macros not found ($missing), falling back to git describe"
+            $safe = ($env:UPSTREAM_DESCRIBE -replace '[^0-9A-Za-z._-]', '_')
+            if ([string]::IsNullOrWhiteSpace($safe)) { $safe = "unknown" }
+            $version = "v$safe"
+          }
+
+          $date = (Get-Date).ToUniversalTime().ToString("yyyyMMdd")
+          $filename = "OptiScaler_${version}_$date"
+          "version=$version"   >> $env:GITHUB_OUTPUT
+          "date=$date"         >> $env:GITHUB_OUTPUT
+          "filename=$filename" >> $env:GITHUB_OUTPUT
+          "archive=OptiScaler-zhcn_${version}_$date.7z" >> $env:GITHUB_OUTPUT
+          Write-Host "version  : $version"
+          Write-Host "filename : $filename"
+
+      - name: Package OptiScaler.dll and OptiScaler.ini
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          ARCHIVE: ${{ steps.version.outputs.archive }}
+        run: |
+          $staging = "dist/stage"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "src/x64/Release/a/OptiScaler.dll" $staging -Force
+          Copy-Item "src/x64/Release/a/OptiScaler.ini" $staging -Force
+          $archive = Join-Path (Resolve-Path "dist").Path $env:ARCHIVE
+          # Run 7z from inside the staging folder with bare file names: the two
+          # entries are then stored flat, with no directory prefix inside the .7z.
+          Push-Location $staging
+          try {
+            7z a -t7z -mx=9 "$archive" OptiScaler.dll OptiScaler.ini
+            if ($LASTEXITCODE -ne 0) { throw "7z failed with exit code $LASTEXITCODE" }
+          }
+          finally { Pop-Location }
+          Write-Host "archive contents:"
+          7z l "$archive"
+
+      - name: Collect the GPL-3.0 corresponding source
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          # Passed through the environment rather than interpolated inline: a
+          # literal ${{ ... }} inside a PowerShell double-quoted string parses as
+          # a variable name and trips PSScriptAnalyzer even though the runner
+          # substitutes it before the script runs.
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $dist = (Resolve-Path dist).Path
+          $srcRoot = (Resolve-Path src).Path
+
+          # Snapshot the submodule status before the overlay commit below: after
+          # an `git add -A` the recorded gitlinks would match whatever is checked
+          # out, so this snapshot is the only place that still knows whether the
+          # build used exactly the commits upstream pins.
+          $lines = @(git -C src submodule status --recursive)
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # `git archive HEAD` exports the commit tree, not the working
+          # directory, so the localized sources would be missing from the bundle
+          # unless they are committed first: menu_common.cpp would ship as the
+          # pristine English file, OptiScaler.ini as the English original, and
+          # the freshly generated OptiScaler/menu/font/CJK_Compressed.h would not
+          # be in the bundle at all. A throwaway commit on top of the upstream
+          # checkout freezes the patched tree into the object store. The upstream
+          # SHA the release notes advertise was captured earlier by the
+          # `Resolve upstream revision` step and is written to upstream-sha.txt
+          # at the end of this step, so the skip check keeps working tomorrow.
+          # Build products stay out of that commit because the upstream
+          # .gitignore already covers x64/, [Rr]elease/, *.dll, *.pdb, *.obj,
+          # *.lib, *.log, *.user plus the MSBuild generated
+          # /OptiScaler/resource_build_*.h and /OptiScaler/misc/Telemetry.*.
+          # What is left to stage is exactly the overlay: the translated
+          # menu_common.cpp, the localized OptiScaler.ini and the generated
+          # font header.
+          git -C src add -A
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::git add -A failed"; exit 1 }
+          # `git diff --cached` is asked instead of `git status`: it lists exactly
+          # what the next commit would contain, so an empty result can skip the
+          # commit instead of letting `git commit` fail with "nothing to commit".
+          $staged = @(git -C src diff --cached --name-only)
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::git diff --cached failed"; exit 1 }
+          if ($staged.Count -gt 0) {
+            Write-Host "committing $($staged.Count) path(s) into the overlay"
+            $staged | ForEach-Object { Write-Host "  $_" }
+            git -C src -c user.name="OptiScaler zh-cn build" -c user.email="zh-cn-build@users.noreply.github.com" -c commit.gpgsign=false commit --no-verify -m "zh-cn localization overlay (generated during the build)"
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not commit the localization overlay"; exit 1 }
+          }
+          else {
+            Write-Host "no working tree change to commit; the bundle holds the pristine upstream tree"
+          }
+          # The bundle must be verifiably the patched tree: anything left
+          # uncommitted would silently drop out of the archive, so a non-empty
+          # list here means the bundle is incomplete. Ignored build products
+          # never appear in it, and --ignore-submodules=dirty keeps a submodule
+          # work tree that merely has local edits from raising a false alarm
+          # (a submodule that was moved to a different commit still shows).
+          $leftover = @(git -C src status --porcelain --ignore-submodules=dirty)
+          if ($leftover.Count -gt 0) {
+            Write-Host "::warning::still uncommitted after the overlay commit:"
+            $leftover | ForEach-Object { Write-Host "  $_" }
+          }
+          # `git status` cannot see this failure mode: a file that an ignore rule
+          # matches is invisible to it, so the overlay commit would succeed with
+          # the file silently absent and the bundle would ship without it. Ask
+          # the commit itself instead. These three paths are what the two
+          # generators always produce, so they have to be in the tree after the
+          # overlay commit; anything missing means an ignore rule or a failed
+          # generator broke the correspondence between binary and source.
+          $tracked = @(git -C src ls-tree -r --name-only HEAD)
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::git ls-tree failed"; exit 1 }
+          foreach ($required in @(
+              "OptiScaler/menu/menu_common.cpp",
+              "OptiScaler/OptiScaler.ini",
+              "OptiScaler/menu/font/CJK_Compressed.h")) {
+            if ($tracked -notcontains $required) {
+              Write-Host "::error::$required is not in the commit that the source bundle is built from; an ignore rule or a failed generator dropped it"
+              exit 1
+            }
+          }
+
+          # GPL-3.0 section 6: whoever distributes the binary must also make the
+          # corresponding source available. Corresponding source covers the
+          # linked submodules too, so `git -C src archive HEAD` alone is not
+          # enough -- it only contains the top-level tree plus the gitlink
+          # entries. (The top-level tree itself is complete: the overlay commit
+          # above put the localized sources and the generated font header into
+          # HEAD, which is why the archive below holds the patched code rather
+          # than the pristine upstream files. What is still missing is the
+          # content *behind* each gitlink.) Every initialised submodule is
+          # therefore archived at its own path inside the bundle as well.
+          $stage = Join-Path $dist "source"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          # 1. the main repository
+          git -C src archive --format=zip -o "$dist/main.zip" HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Expand-Archive "$dist/main.zip" -DestinationPath $stage -Force
+          Remove-Item "$dist/main.zip"
+
+          # 2. every initialised submodule, archived into its own path.
+          # `submodule status --recursive` is used instead of parsing
+          # .gitmodules because .gitmodules only declares the direct children;
+          # nested submodules would silently be missing from the bundle. The
+          # leading status character tells whether a work tree exists at all:
+          # '-' means the submodule was never initialised (git only knows the
+          # recorded SHA), so it cannot be archived and is skipped loudly.
+          # $lines was captured before the overlay commit; see the comment there.
+          $shas = Join-Path $dist "submodule-shas.txt"
+          if (Test-Path $shas) { Remove-Item $shas -Force }
+          $archived = 0
+          foreach ($line in $lines) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            if ($line -notmatch '^([ +\-U])([0-9a-f]{40,64}) (\S.*?)(?: \([^)]*\))?$') {
+              Write-Host "::warning::could not parse submodule status line '$line'"
+              continue
+            }
+            $state = $Matches[1]
+            $recordedSha = $Matches[2]
+            $p = $Matches[3]
+            if ($state -eq '-') {
+              Write-Host "::warning::submodule $p is not initialized, skipped from the source bundle"
+              continue
+            }
+            $target = Join-Path $srcRoot $p
+            if (-not (Test-Path -LiteralPath $target)) {
+              Write-Host "::warning::submodule path $p does not exist on disk, skipped"
+              continue
+            }
+            $subSha = (git -C $target rev-parse HEAD).Trim()
+            if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($subSha)) {
+              Write-Host "::error::could not resolve the checked out commit of submodule $p"
+              exit 1
+            }
+            $out = Join-Path $dist ("sub-" + ($p -replace '[\\/]', '-') + ".zip")
+            git -C $target archive --format=zip -o $out HEAD
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $dest = Join-Path $stage $p
+            New-Item -ItemType Directory -Force -Path $dest | Out-Null
+            Expand-Archive $out -DestinationPath $dest -Force
+            Remove-Item $out
+            $note = ""
+            if ($subSha -ne $recordedSha) { $note = "  (recorded $recordedSha, checked out $subSha)" }
+            Add-Content -Path $shas -Value "$p $subSha$note"
+            Write-Host "archived submodule $p @ $subSha$note"
+            $archived++
+          }
+          if ($archived -eq 0) {
+            Write-Host "::warning::no submodule was archived; corresponding-source.zip only holds the main repository"
+          }
+
+          # Compress-Archive is documented to choke on entries above 2 GB; the
+          # whole source tree is ~1.5 GB before compression, so the merged zip
+          # stays far below that. The size check below makes a surprise loud
+          # instead of leaving a corrupt release attachment behind.
+          $bundle = Join-Path $dist "corresponding-source.zip"
+          Compress-Archive -Path "$stage\*" -DestinationPath $bundle -Force
+          Remove-Item $stage -Recurse -Force
+
+          # Written from the pre-overlay snapshot for the same reason as
+          # upstream-sha.txt: after `git add -A` the index may describe the
+          # working tree rather than the commits upstream actually pins.
+          $lines | Out-File -FilePath "$dist/submodules.txt" -Encoding utf8
+          # Not `git -C src rev-parse HEAD`: HEAD is the throwaway overlay commit
+          # now. The advertised upstream SHA comes from the `Resolve upstream
+          # revision` step, which ran before the overlay, so the `upstream-sha:`
+          # marker in the release notes stays true and the next scheduled run
+          # still recognises this commit as already released.
+          $env:UPSTREAM_SHA | Out-File -FilePath "$dist/upstream-sha.txt" -Encoding utf8
+
+          $size = (Get-Item $bundle).Length
+          Write-Host ("corresponding-source.zip  {0} bytes ({1:N1} MB)" -f $size, ($size / 1MB))
+          if ($size -gt 1.5GB) {
+            Write-Host "::warning::corresponding-source.zip is larger than 1.5 GB; GitHub release assets are limited to 2 GB per file"
+          }
+          Get-ChildItem dist | Format-Table Name, Length -AutoSize | Out-String | Write-Host
+
+      - name: Render the release notes
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          UPSTREAM_SHA: ${{ steps.upstream.outputs.sha }}
+          UPSTREAM_DESCRIBE: ${{ steps.upstream.outputs.describe }}
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCHIVE: ${{ steps.version.outputs.archive }}
+        run: |
+          $env:BUILD_DATE = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
+          python self/tools_cn/render_notes.py --template self/.github/release-notes-auto.md --out dist/notes.md --require UPSTREAM_SHA UPSTREAM_DESCRIBE BUILD_DATE ARCHIVE VERSION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload the build artifacts
+        if: steps.check.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: OptiScaler-zhcn-${{ steps.version.outputs.filename }}
+          if-no-files-found: error
+          path: |
+            dist/*.7z
+            dist/corresponding-source.zip
+            dist/submodules.txt
+            dist/submodule-shas.txt
+            dist/notes.md
+
+      - name: Publish the release
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          GH_REPO: ${{ github.repository }}
+          TAG: zh-cn-${{ steps.version.outputs.filename }}
+          ARCHIVE: ${{ steps.version.outputs.archive }}
+          FILENAME: ${{ steps.version.outputs.filename }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Tags are managed through the API on purpose: the working directory is
+          # not this repository's checkout (self/ and src/ are nested), so any
+          # git-side tag deletion would target the wrong repository.
+          gh release view "$env:TAG" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "replacing existing release $env:TAG"
+            gh release delete "$env:TAG" --yes --cleanup-tag
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+
+          # Built as a list because submodule-shas.txt only exists when the
+          # upstream actually declares initialised submodules.
+          $assets = @(
+            "dist/$env:ARCHIVE",
+            "dist/corresponding-source.zip",
+            "dist/submodules.txt",
+            "dist/upstream-sha.txt"
+          )
+          if (Test-Path "dist/submodule-shas.txt") { $assets += "dist/submodule-shas.txt" }
+
+          gh release create "$env:TAG" @assets `
+            --title "OptiScaler 简体中文 $env:VERSION ($env:FILENAME)" `
+            --notes-file dist/notes.md `
+            --prerelease
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Write-Host "published $env:TAG"

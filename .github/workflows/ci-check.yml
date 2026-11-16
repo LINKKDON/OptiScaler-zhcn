@@ -1,0 +1,150 @@
+name: CI
+
+# Fast repository-only checks. This workflow never checks out the upstream
+# sources: it validates the tooling that the thin repository ships.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Tooling checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python3 -m pip install --disable-pip-version-check pyyaml fonttools
+
+      - name: Byte-compile the tooling
+        run: python3 -m py_compile tools_cn/*.py
+
+      - name: stb_compress / stb_decompress round-trip self test
+        run: python3 tools_cn/build_font.py --selftest
+
+      - name: Validate the translation dictionary
+        run: python3 tools_cn/localize.py --check-dict --tools tools_cn
+
+      - name: Validate the ini comment dictionary
+        run: python3 tools_cn/localize_ini.py --ini tools_cn/sample_OptiScaler.ini --check
+
+      - name: Validate the ini comment dictionary shape
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          # The comment dictionary is read-only here: this job never writes it.
+          # It only asserts the shape split_comment() relies on - every key must
+          # be the comment body with no surrounding whitespace, because the
+          # ";   " prefix and any trailing spaces are restored from the line
+          # itself, not from the dictionary.
+          path = pathlib.Path('tools_cn/dict_ini.json')
+          raw = path.read_bytes()
+          problems = []
+          if raw.startswith(b'\xef\xbb\xbf'):
+              problems.append('file has a UTF-8 BOM')
+          try:
+              table = json.loads(raw.decode('utf-8'))
+          except (UnicodeDecodeError, ValueError) as exc:
+              print(f'{path}: not valid JSON: {exc}', file=sys.stderr)
+              sys.exit(1)
+          if not isinstance(table, dict):
+              print(f'{path}: must contain a JSON object', file=sys.stderr)
+              sys.exit(1)
+          for key, value in table.items():
+              if not isinstance(value, str):
+                  problems.append(f'{key!r}: value is not a string')
+                  continue
+              if key != key.strip():
+                  problems.append(f'{key!r}: key has leading/trailing whitespace')
+              if value != value.strip():
+                  problems.append(f'{key!r}: value has leading/trailing whitespace')
+              if not key.strip():
+                  problems.append('empty key')
+              if not value.strip():
+                  problems.append(f'{key!r}: empty value')
+              for field, text in (('key', key), ('value', value)):
+                  if '\n' in text or '\r' in text:
+                      problems.append(f'{key!r}: {field} contains a newline')
+          for line in problems[:20]:
+              print(line, file=sys.stderr)
+          print(f'{path}: {len(table)} entries, {len(problems)} shape problem(s)')
+          sys.exit(1 if problems else 0)
+          PY
+
+      - name: Validate every workflow file
+        run: |
+          python3 - <<'PY'
+          import glob
+          import sys
+          import yaml
+
+          failed = False
+          for path in sorted(glob.glob('.github/workflows/*.yml')):
+              with open(path, encoding='utf-8') as handle:
+                  doc = yaml.safe_load(handle)
+              if not isinstance(doc, dict) or not doc:
+                  print(f'{path}: not a non-empty mapping', file=sys.stderr)
+                  failed = True
+                  continue
+              jobs = doc.get('jobs')
+              if not isinstance(jobs, dict) or not jobs:
+                  print(f'{path}: no jobs', file=sys.stderr)
+                  failed = True
+                  continue
+              print(f'{path}: OK ({", ".join(jobs)})')
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Check for tabs, BOMs and CRLF line endings
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          # Only the paths this repository actually ships are scanned. Local
+          # scratch directories that may exist next to a working copy (an
+          # upstream checkout under OptiScaler/, a verify/ or _ini/ workspace)
+          # are never committed and are deliberately out of scope.
+          roots = [pathlib.Path('tools_cn'), pathlib.Path('.github')]
+          candidates = [p for root in roots if root.is_dir() for p in root.rglob('*')]
+          candidates += [pathlib.Path(name) for name in
+                         ('README.md', 'MIGRATION.md', 'LICENSE',
+                          '.gitignore', '.gitattributes')]
+
+          suffixes = {'.py', '.json', '.md', '.yml', '.gitignore', '.gitattributes'}
+          bad = []
+          for path in sorted(candidates):
+              if not path.is_file():
+                  continue
+              if path.suffix not in suffixes and path.name not in ('.gitignore', '.gitattributes'):
+                  continue
+              data = path.read_bytes()
+              if data.startswith(b'\xef\xbb\xbf'):
+                  bad.append(f'{path}: UTF-8 BOM (rewrite the file as UTF-8 without BOM)')
+              if b'\r\n' in data:
+                  bad.append(f'{path}: CRLF line endings (this repository is LF only)')
+              if b'\t' in data and path.suffix in {'.yml', '.py'}:
+                  bad.append(f'{path}: tab character (YAML and Python must use spaces)')
+          for line in bad:
+              print(line, file=sys.stderr)
+          print(f'scanned {len(candidates)} path(s), {len(bad)} problem(s)')
+          sys.exit(1 if bad else 0)
+          PY
