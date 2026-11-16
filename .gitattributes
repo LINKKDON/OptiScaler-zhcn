@@ -1,0 +1,24 @@
+# Normalize every text file to LF in the repository, on every platform.
+#
+# This matters because the CI hygiene job (see .github/workflows/ci-check.yml)
+# rejects CRLF. Without this file a Windows contributor can commit a CRLF blob
+# even though the file "looks fine" locally, and the check then fails for
+# everybody. With `eol=lf` git stores LF and checks LF out everywhere.
+* text=auto eol=lf
+
+# Generated / third-party payloads must never be line-ending converted.
+*.7z    binary
+*.zip   binary
+*.dll   binary
+*.pdb   binary
+*.ttf   binary
+*.ttc   binary
+*.otf   binary
+
+# GitHub renders these from the worktree, so keep them explicit.
+*.yml   text eol=lf
+*.py    text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+.gitignore     text eol=lf
+.gitattributes text eol=lf
