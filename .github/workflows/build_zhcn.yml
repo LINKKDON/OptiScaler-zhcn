@@ -56,6 +56,17 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 90
 
+    # The gh CLI refuses to run inside Actions without GH_TOKEN:
+    #   "To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN
+    #    environment variable."
+    # It is set once at job level rather than per step so a future gh call
+    # cannot silently inherit the anonymous client again. `permissions:
+    # contents: write` above is what grants this token the right to publish.
+    # Reads of the upstream repository go through the same token; public
+    # repositories are readable by any authenticated token.
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
     steps:
       - name: Checkout this repository (tooling)
         uses: actions/checkout@v4
