@@ -27,6 +27,14 @@ OptiScaler 安装目录（即上游官方包解压后的那个目录）覆盖同
 upstream-sha: {{UPSTREAM_SHA}}
 upstream-version: {{UPSTREAM_DESCRIBE}}
 
+## 汉化覆盖率 / translation coverage
+
+{{COVERAGE}}
+
+这是「本版字典还能命中上游多少条可译字面量」的实测值。上游改动菜单措辞后，未跟进的
+条目会退回英文，所以这个数字会随上游漂移；构建脚本会在它相对基线一次掉超过 20 条时
+直接失败，掉 1–20 条时只报警。
+
 ## SignPath 配置 / SignPath configuration
 
 | 项目 | 值 |

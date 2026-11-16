@@ -55,7 +55,7 @@ jobs:
   build:
     name: Build, sign and publish
     runs-on: windows-latest
-    timeout-minutes: 90
+    timeout-minutes: 30
 
     # The gh CLI refuses to run inside Actions without GH_TOKEN:
     #   "To use GitHub CLI in a GitHub Actions workflow, set the GH_TOKEN
@@ -244,6 +244,74 @@ jobs:
           python self/tools_cn/build_font.py @fontArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+      - name: Report the translation coverage
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          # Runs BEFORE the injection on purpose. --coverage compares the
+          # dictionary against the pristine upstream sources; once localize.py
+          # has replaced the keys with their translations a byte scan for the
+          # keys finds almost nothing, and counting the translations instead is
+          # not comparable (46 values are shared by two keys, and the merge block
+          # adds literals of its own). Measured after injection --coverage
+          # reports 35/1685 for a tree whose pristine numbers are 1223/1783, and
+          # a 35 would read as a catastrophic regression instead of what it is:
+          # a measurement artefact of scanning for keys in an already-injected
+          # tree.
+          # The gate is a "do not silently regress" anchor, not a parity lock:
+          # upstream deleting UI legitimately lowers translated, and the fix is
+          # to re-record tools_cn/coverage-baseline.json after reviewing it.
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          python self/tools_cn/localize.py --repo src --tools self/tools_cn --coverage --coverage-json dist/coverage.json --baseline self/tools_cn/coverage-baseline.json
+          $code = $LASTEXITCODE
+
+          # The summary is written whatever the verdict is, so a failed run still
+          # shows the numbers a maintainer needs to decide whether to re-record
+          # the baseline or go fix the dictionary.
+          if (Test-Path dist/coverage.json) {
+            $c = Get-Content -Raw dist/coverage.json | ConvertFrom-Json
+            $delta = [int]$c.delta
+            $sign = if ($delta -gt 0) { "+$delta" } else { "$delta" }
+            $pdelta = [double]$c.percent_delta
+            $psign = if ($pdelta -gt 0) { "+$pdelta" } else { "$pdelta" }
+            $lines = @(
+              '### 汉化覆盖率 / translation coverage',
+              '',
+              '| 指标 | 值 |',
+              '| --- | --- |',
+              ("| 已翻译 translated | {0} |" -f $c.translated),
+              ("| 上游可译字面量 total | {0} |" -f $c.total),
+              ("| 覆盖率 percent | {0}% |" -f $c.percent),
+              ("| 基线 baseline | {0} |" -f $c.baseline),
+              ("| 相对基线 delta | {0} |" -f $sign),
+              ("| 基线覆盖率 baseline percent | {0}% |" -f $c.baseline_percent),
+              ("| 覆盖率变化 percent delta | {0} 个百分点 |" -f $psign),
+              ("| 基线记录的上游 commit | {0} |" -f $c.upstream_sha),
+              '',
+              '基线文件是「不许静默倒退」的锚，不是「必须持平」的锁：上游删词导致 translated 变小属正常，人工确认后主动更新 `tools_cn/coverage-baseline.json` 即可。'
+            )
+            $lines | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+            # Two independent signals, and only one of them can fail the build:
+            #   delta         = translated - baseline. Falling below -20 is fatal
+            #                   (upstream reworded the UI and we lost real
+            #                   translations); the tool exits non-zero for that.
+            #   percent_delta = percent - baseline_percent. Falling while delta is
+            #                   still >= 0 means `total` grew - upstream added UI
+            #                   strings nobody has translated yet. That is normal
+            #                   drift, so localize.py only emits a ::warning:: and
+            #                   still exits 0. Never turn it into a failure here.
+            if ($pdelta -lt -5.0 -and $delta -ge -20) {
+              $added = [int]$c.total - [int]$c.baseline_total
+              '> 注意：覆盖率从 {0}% 降到 {1}%（上游新增 {2} 条未翻译字面量）。' -f $c.baseline_percent, $c.percent, $added |
+                Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+            }
+          }
+          else {
+            '### 汉化覆盖率 / translation coverage' | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+            '覆盖率测量没有产出 dist/coverage.json，见上一步日志。' | Add-Content -Path $env:GITHUB_STEP_SUMMARY -Encoding utf8
+          }
+          if ($code -ne 0) { exit $code }
+
       - name: Inject the Chinese translations and the font merge block
         if: steps.check.outputs.skip != 'true'
         run: >-
@@ -257,7 +325,10 @@ jobs:
         run: |
           python self/tools_cn/localize_ini.py --ini src/OptiScaler.ini --dict self/tools_cn/dict_ini.json --out src/OptiScaler.ini --report
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          python self/tools_cn/localize_ini.py --ini src/OptiScaler.ini --dict self/tools_cn/dict_ini.json --check
+          # --check must be given --out: without a comparison target the
+          # strongest assertion (the file on disk is a fresh translation) would
+          # be skipped, which is exactly how a stale ini used to ship.
+          python self/tools_cn/localize_ini.py --ini src/OptiScaler.ini --dict self/tools_cn/dict_ini.json --out src/OptiScaler.ini --check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Add MSBuild to PATH
@@ -268,6 +339,14 @@ jobs:
         if: steps.check.outputs.skip != 'true'
         shell: pwsh
         run: |
+          # Upstream's vcxproj has no /utf-8, and menu_common.cpp is pure ASCII
+          # until localize.py injects UTF-8 Chinese into it. Without this, cl.exe
+          # decodes the source with the system ANSI code page and the strings end
+          # up as mojibake in the DLL - a build that succeeds and renders
+          # garbage. CL is prepended to the compiler command line by MSBuild, so
+          # this does not require patching the upstream project file.
+          $env:CL = "/utf-8"
+          Write-Host "CL=$env:CL"
           msbuild $env:SOLUTION_FILE_PATH /m /p:Configuration=$env:BUILD_CONFIGURATION /verbosity:minimal
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
@@ -290,6 +369,23 @@ jobs:
               Select-Object -First 40 FullName | Format-Table -AutoSize | Out-String | Write-Host
             exit 1
           }
+
+          # The source tree must still carry the localization at this point.
+          # localize.py's own post-condition already ran, but re-reading it here
+          # proves that nothing between the injection and the compile reverted it
+          # (a stray checkout, a reset, a formatter).
+          python self/tools_cn/localize.py --repo src --tools self/tools_cn --verify
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Artifact-level check: the old fork never inspected the binary, so a
+          # build that compiled without the Chinese strings still shipped. These
+          # two values come from dict_v10.json and are menu-visible strings, so
+          # their UTF-8 bytes must appear in the DLL. A miss means either the
+          # injection was skipped or cl.exe read the source with the ANSI code
+          # page (CL=/utf-8 not in effect).
+          python self/tools_cn/verify_binary.py --dll src/x64/Release/a/OptiScaler.dll `
+            --expect-utf8 "重投影设置" --expect-utf8 "正在打开 ImGui"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # ------------------------------------------------------------------
       # SignPath, official trusted-build path
@@ -687,10 +783,24 @@ jobs:
             ) -join "`n"
           }
           $env:BUILD_TARGET_NOTICE = $notice.Trim()
+          # render_notes.py fails when a placeholder in the template has no
+          # value, so COVERAGE has to be non-empty even if the coverage step
+          # somehow did not write its JSON. The fallback says so instead of
+          # pretending the numbers are known.
+          if (Test-Path dist/coverage.json) {
+            $c = Get-Content -Raw dist/coverage.json | ConvertFrom-Json
+            $delta = [int]$c.delta
+            $sign = if ($delta -gt 0) { "+$delta" } else { "$delta" }
+            $env:COVERAGE = ("中文串 {0} / 共 {1} 条（{2}%），基线 {3}（{4}）" -f `
+              $c.translated, $c.total, $c.percent, $c.baseline, $sign)
+          }
+          else {
+            $env:COVERAGE = "覆盖率数据缺失（dist/coverage.json 未生成），见构建日志"
+          }
           # The SignPath identifiers come from the workflow level env block and
           # are spelled out in the notes, so a stale binding is visible on the
           # release page and not only inside the workflow file.
-          python self/tools_cn/render_notes.py --template self/.github/release-notes-signed.md --out dist/notes.md --require UPSTREAM_SHA UPSTREAM_DESCRIBE BUILD_DATE ARCHIVE VERSION BUILD_TARGET_NOTICE SIGNPATH_ORGANIZATION_ID SIGNPATH_PROJECT_SLUG SIGNPATH_POLICY_SLUG SIGNPATH_POLICY_ID
+          python self/tools_cn/render_notes.py --template self/.github/release-notes-signed.md --out dist/notes.md --require UPSTREAM_SHA UPSTREAM_DESCRIBE BUILD_DATE ARCHIVE VERSION BUILD_TARGET_NOTICE COVERAGE SIGNPATH_ORGANIZATION_ID SIGNPATH_PROJECT_SLUG SIGNPATH_POLICY_SLUG SIGNPATH_POLICY_ID
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload the build artifacts

@@ -289,6 +289,16 @@ def main() -> int:
         print(f"rejected by guard    : {stats.rejected}")
 
     if args.check:
+        # Without --out there is nothing to compare against, and the strongest
+        # assertion this script has - "the file on disk is byte-for-byte a fresh
+        # translation" - would silently never run. That is how a --check step
+        # can be green while the ini on disk is stale or half-translated, so a
+        # missing comparison target is an error, not a warning.
+        if args.out is None:
+            print("ERROR: --check needs --out <path> to compare the on-disk file "
+                  "against a fresh translation", file=sys.stderr)
+            return 2
+
         failures = 0
         if problems:
             failures += 1
@@ -307,7 +317,12 @@ def main() -> int:
             failures += 1
         print(f"  CHECK: newline style {newline!r}, lines {len(out_lines)}")
 
-        if args.out and args.out.exists():
+        if not args.out.exists():
+            print(f"  CHECK: {args.out} does not exist, so the file that would be "
+                  f"shipped cannot be compared against a fresh translation",
+                  file=sys.stderr)
+            failures += 1
+        else:
             disk_text, disk_bom, _ = read_ini(args.out)
             if disk_bom:
                 print(f"  CHECK: {args.out} has a BOM", file=sys.stderr)
@@ -318,8 +333,6 @@ def main() -> int:
                 failures += 1
             else:
                 print(f"  CHECK: {args.out} matches a fresh translation")
-        elif args.out:
-            print(f"  WARNING: {args.out} does not exist yet, skipped the on-disk comparison")
 
         if had_bom:
             print("  WARNING: input had a BOM, output keeps it")

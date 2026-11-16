@@ -1,0 +1,7 @@
+{
+  "upstream_sha": "572a09cc0497320cbe46dd9e4e9bba5a2333abaf",
+  "recorded_at": "2026-11-16T14:40:00+08:00",
+  "translated": 1223,
+  "total": 1783,
+  "note": "Anchor against silent coverage loss, not a lock on parity. Re-record this file (new upstream_sha, new numbers) whenever a coverage drop is reviewed and accepted, and say why in the commit message. Measured with: python tools_cn/localize.py --repo <upstream master checkout> --tools tools_cn --coverage. On 2026-11-13 the same dictionary covered 1248 of 1720; upstream then removed the whole FG status/activation UI group (25 dead keys) and added ~90 new literals, so translated fell to 1223 while total rose to 1783."
+}

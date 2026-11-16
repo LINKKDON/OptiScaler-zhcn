@@ -32,16 +32,66 @@ jobs:
         run: python3 -m pip install --disable-pip-version-check pyyaml fonttools
 
       - name: Byte-compile the tooling
-        run: python3 -m py_compile tools_cn/*.py
+        run: python3 -m py_compile tools_cn/*.py tools_cn/selftests/*.py
 
       - name: stb_compress / stb_decompress round-trip self test
         run: python3 tools_cn/build_font.py --selftest
+
+      - name: Anchor drift regression test
+        run: python3 tools_cn/selftests/run_drift_selftest.py
+
+      - name: verify_binary.py self test
+        # The real artifact check can only run on the Windows build, so its
+        # logic is pinned here against synthetic files: a hit must pass, a miss
+        # must fail, and an invocation without expectations must be refused
+        # (otherwise the build step could pass vacuously).
+        run: |
+          set -eu
+          tmp="$(mktemp -d)"
+          python3 - "$tmp" <<'PY'
+          import pathlib
+          import sys
+          root = pathlib.Path(sys.argv[1])
+          root.joinpath('good.dll').write_bytes(
+              b'MZ' + b'\x00' * 64 + '重投影设置'.encode('utf-8') + b'\x00' * 16
+              + '正在打开 ImGui'.encode('utf-8') + b'\x00' * 32)
+          # A mojibake build: the same characters re-encoded as GBK never
+          # contains the UTF-8 byte sequence.
+          root.joinpath('gbk.dll').write_bytes(
+              b'MZ' + b'\x00' * 64 + '重投影设置'.encode('gbk') + b'\x00' * 32)
+          PY
+          python3 tools_cn/verify_binary.py --dll "$tmp/good.dll" \
+            --expect-utf8 "重投影设置" --expect-utf8 "正在打开 ImGui"
+          if python3 tools_cn/verify_binary.py --dll "$tmp/gbk.dll" \
+               --expect-utf8 "重投影设置"; then
+            echo "ERROR: verify_binary.py accepted an ANSI-encoded build" >&2
+            exit 1
+          fi
+          if python3 tools_cn/verify_binary.py --dll "$tmp/good.dll"; then
+            echo "ERROR: verify_binary.py passed with no expectations" >&2
+            exit 1
+          fi
+          echo "verify_binary.py self test OK"
 
       - name: Validate the translation dictionary
         run: python3 tools_cn/localize.py --check-dict --tools tools_cn
 
       - name: Validate the ini comment dictionary
-        run: python3 tools_cn/localize_ini.py --ini tools_cn/sample_OptiScaler.ini --check
+        # --check requires --out, so translate the sample to a scratch file first
+        # and then assert that the scratch file is byte-identical to a fresh
+        # translation. Without --out the on-disk comparison would be skipped and
+        # the step would only be checking the invariants of an in-memory copy.
+        run: |
+          set -eu
+          tmp="$(mktemp -d)"
+          python3 tools_cn/localize_ini.py \
+            --ini tools_cn/sample_OptiScaler.ini \
+            --dict tools_cn/dict_ini.json \
+            --out "$tmp/sample.ini" --report
+          python3 tools_cn/localize_ini.py \
+            --ini tools_cn/sample_OptiScaler.ini \
+            --dict tools_cn/dict_ini.json \
+            --out "$tmp/sample.ini" --check
 
       - name: Validate the ini comment dictionary shape
         run: |
@@ -89,6 +139,68 @@ jobs:
           sys.exit(1 if problems else 0)
           PY
 
+      - name: Check the coverage baseline is well-formed
+        run: |
+          python3 - <<'PY'
+          import datetime
+          import json
+          import pathlib
+          import re
+          import sys
+
+          # Offline on purpose: checking the baseline's shape must not drag a
+          # 1.5 GB upstream checkout into a job that otherwise finishes in
+          # seconds. The real coverage comparison runs in the build workflows,
+          # against a fresh upstream checkout.
+          path = pathlib.Path('tools_cn/coverage-baseline.json')
+          if not path.exists():
+              print(f'{path}: missing; the build workflows compare the coverage '
+                    f'against this file', file=sys.stderr)
+              sys.exit(1)
+          raw = path.read_bytes()
+          problems = []
+          if raw.startswith(b'\xef\xbb\xbf'):
+              problems.append('file has a UTF-8 BOM')
+          try:
+              data = json.loads(raw.decode('utf-8'))
+          except (UnicodeDecodeError, ValueError) as exc:
+              print(f'{path}: not valid JSON: {exc}', file=sys.stderr)
+              sys.exit(1)
+          if not isinstance(data, dict):
+              print(f'{path}: must contain a JSON object', file=sys.stderr)
+              sys.exit(1)
+
+          sha = data.get('upstream_sha')
+          if not isinstance(sha, str) or not re.fullmatch(r'[0-9a-f]{40}', sha):
+              problems.append(f'upstream_sha must be 40 lowercase hex characters, '
+                              f'got {sha!r}')
+
+          stamp = data.get('recorded_at')
+          try:
+              datetime.datetime.fromisoformat(str(stamp))
+          except (TypeError, ValueError):
+              problems.append(f'recorded_at must be an ISO-8601 timestamp, got {stamp!r}')
+
+          translated = data.get('translated')
+          total = data.get('total')
+          for name, value in (('translated', translated), ('total', total)):
+              if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+                  problems.append(f'{name} must be a positive integer, got {value!r}')
+          if (isinstance(translated, int) and isinstance(total, int)
+                  and not isinstance(translated, bool) and not isinstance(total, bool)
+                  and 0 < total < translated):
+              problems.append(f'translated ({translated}) cannot exceed total ({total})')
+
+          note = data.get('note')
+          if not isinstance(note, str) or not note.strip():
+              problems.append('note must explain why the baseline was re-recorded')
+
+          for line in problems:
+              print(line, file=sys.stderr)
+          print(f'{path}: {len(data)} field(s), {len(problems)} problem(s)')
+          sys.exit(1 if problems else 0)
+          PY
+
       - name: Validate every workflow file
         run: |
           python3 - <<'PY'
@@ -129,7 +241,8 @@ jobs:
                          ('README.md', 'MIGRATION.md', 'LICENSE',
                           '.gitignore', '.gitattributes')]
 
-          suffixes = {'.py', '.json', '.md', '.yml', '.gitignore', '.gitattributes'}
+          suffixes = {'.py', '.json', '.md', '.yml', '.ini', '.cpp',
+                      '.gitignore', '.gitattributes'}
           bad = []
           for path in sorted(candidates):
               if not path.is_file():

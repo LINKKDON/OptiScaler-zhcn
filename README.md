@@ -123,7 +123,11 @@ msbuild src/OptiScaler.sln /m /p:Configuration=Release /verbosity:minimal
 python tools_cn/build_font.py --selftest          # stb_compress/stb_decompress 往返测试（9 种尺寸）
 python tools_cn/build_font.py --check             # 只做字典字符覆盖校验，缺字打印码位并返回 1
 python tools_cn/localize.py --check-dict --tools tools_cn
-python tools_cn/localize_ini.py --ini tools_cn/sample_OptiScaler.ini --check
+python tools_cn/localize.py --repo src --tools tools_cn --verify    # 复检注入结果（只读）
+python tools_cn/localize.py --repo src --tools tools_cn --coverage --baseline tools_cn/coverage-baseline.json
+python tools_cn/verify_binary.py --dll <编译出的 OptiScaler.dll> --expect-utf8 重投影设置
+python tools_cn/selftests/run_drift_selftest.py   # 锚点漂移回归（8 例）
+python tools_cn/localize_ini.py --ini tools_cn/sample_OptiScaler.ini --check --out <临时文件>
 python tools_cn/localize_ini.py --ini <上游 OptiScaler.ini> --report    # 还有多少注释未译
 python tools_cn/localize_ini.py --ini <上游 OptiScaler.ini> --lint-dict # 字典里有没有多余/过期键
 ```
@@ -141,7 +145,7 @@ python tools_cn/localize_ini.py --ini <上游 OptiScaler.ini> --lint-dict # 字�
 | --- | --- | --- |
 | `build_zhcn.yml` (`Build Chinese (Auto)`) | 每天 06:00 UTC 定时；也可手动 dispatch（`force` 勾上则强制重建） | 检查上游是否更新；有更新就编译并发布未签名 Release |
 | `build_zhcn_signed.yml` (`Build Chinese (Signed)`) | 仅手动 dispatch | 同上去加 SignPath 签名，发布签名版 Release |
-| `ci-check.yml` (`CI`) | 本仓库 push / PR | 秒级自检：py_compile、stb 往返、字典校验、ini 校验、YAML 可解析、无 BOM/CRLF/tab |
+| `ci-check.yml` (`CI`) | 本仓库 push / PR | 秒级自检：py_compile、stb 往返、锚点漂移回归、`verify_binary.py` 自测、字典校验、ini 校验、覆盖率基线形状、YAML 可解析、无 BOM/CRLF/tab |
 
 ### 手动 dispatch 的两个输入
 
@@ -158,11 +162,36 @@ python tools_cn/localize_ini.py --ini <上游 OptiScaler.ini> --lint-dict # 字�
 
 **构建历史 tag 时汉化不完整。** 字典是按 `master` 的措辞写的；历史版本里被上游改过措辞的注释会保留英文原文，`localize_ini.py --report` 会把它们计入 `not in dictionary`。配置项与取值不受影响。Release 说明里会自动加一段中文提示说明这一点。
 
-`ci-check.yml` 共 10 步，最后一步只扫本仓库真正发布的路径（`tools_cn/`、`.github/`、`README.md`、`MIGRATION.md`、`LICENSE`、`.gitignore`、`.gitattributes`），不去扫本机的临时工作目录。
+`ci-check.yml` 共 13 步，全部离线跑（**刻意不 checkout 上游**——那会把每次 push 的 CI 从十几秒拖到几十分钟）。第 13 步只扫本仓库真正发布的路径（`tools_cn/`、`.github/`、`README.md`、`MIGRATION.md`、`LICENSE`、`.gitignore`、`.gitattributes`），不去扫本机的临时工作目录。
 
 仓库带 `.gitattributes`（`* text=auto eol=lf`，二进制扩展名标 `binary`），`*.py` / `*.json` / `*.yml` / `*.md` 一律存 LF。就算有人在 CRLF 工作区提交，git 也会在入库时归一化——但别指望它兜底，最后那步扫描才是真正的防线。
 
-**为什么没有 push 触发构建**：改文档、改字典不该触发一次 90 分钟的编译。定时任务会先比对上游 commit，如果 `OptiScaler.dll` 对应的 `upstream-sha` 已经发过 Release 就直接跳过（`skip` 输出 + Step Summary 说明）。
+### 覆盖率护栏（上游漂移的报警器）
+
+上游改一句菜单措辞，我们字典里那条键就变成死键，对应的菜单项**悄悄变回英文**——CI 全绿，没人发现。这就是旧 fork 的典型毛病，所以这里加了一道护栏。
+
+两个构建工作流在**注入之前**（第 9 步 `Report the translation coverage`）跑：
+
+```
+python self/tools_cn/localize.py --repo src --tools self/tools_cn --coverage \
+  --coverage-json dist/coverage.json --baseline self/tools_cn/coverage-baseline.json
+```
+
+输出一行机器可读的 `coverage: translated=1223 total=1783 percent=68.6 baseline=1223 delta=0`，然后按 `delta` 判：
+
+| `delta` | 行为 |
+| --- | --- |
+| `>= 0` | 通过 |
+| `-20 < delta < 0` | `::warning::`，构建继续 |
+| `delta <= -20` | `::error::` + 构建失败 |
+
+数字同时写进 Step Summary（中文 markdown 表格）与 Release 说明的「汉化覆盖率」一节。
+
+**为什么必须在注入之前测**：注入会把源码里的英文 key 换成中文，之后再数「字典能命中多少 key」就不成立了（实测注入后 `translated` 反而涨到 1245、`total` 掉到 1685）。这一点与「注入后再校验」的直觉相反，`localize.py` 里对应位置有注释说明。
+
+`tools_cn/coverage-baseline.json` 是**锚，不是锁**：上游删词导致 `translated` 变小是正常的。人工确认后主动更新这个文件（新 `upstream_sha`、新数字、`note` 写清原因），并在 commit message 里说明。`ci-check.yml` 第 11 步只离线校验这个文件的形状（40 位十六进制 SHA、ISO-8601 时间、正整数、`translated <= total`），不拉上游。
+
+**为什么没有 push 触发构建**：改文档、改字典不该触发一次 30 分钟的编译。定时任务会先比对上游 commit，如果 `OptiScaler.dll` 对应的 `upstream-sha` 已经发过 Release 就直接跳过（`skip` 输出 + Step Summary 说明）。
 
 **`submodules: recursive` 的代价**：上游 `.gitmodules` 声明的子模块合计约 1.49 GB（`intel/xess` ≈660 MB、`FidelityFX-SDK` ≈554 MB、`nvapi` ≈120 MB、`Vulkan-Headers` ≈92 MB，其余几个都很小），每次构建都要重新拉一遍。**两个工作流都刻意没有挂 `actions/cache`**：缓存 `src/.git/modules` 看起来能省掉这 1.49 GB，但 `actions/checkout` 的 `prepareExistingDirectory()` 在目标路径存在 `.git` 却没有可用的 `remote.origin.url` 时会把目录内容整个删掉，而缓存的 `modules/` 里没有 `.git/config` —— 恢复出来的对象随即被清空。键又是按 `run_id` 生成的，永远命不中确切条目，于是每次运行都要在收尾时上传约 1.5 GB 却从不复用，比不缓存更糟。真要缓存得改成 `submodules: false` + 手动 `git submodule update --init --recursive`，那会引入一个只能在真实 runner 上验证的新失败点，暂时不做。子模块参与链接，也不能砍。
 
@@ -194,16 +223,21 @@ python tools_cn/localize_ini.py --ini <上游 OptiScaler.ini> --lint-dict # 字�
   release-notes-signed.md  Release 说明模板（签名版）
 tools_cn/
   build_font.py            子集化字体 -> stb 压缩 -> 生成 CJK_Compressed.h
-  localize.py              替换 C++ 里的 UI 字面量 + 插入字体合并代码
+  localize.py              替换 C++ 里的 UI 字面量 + 插入字体合并代码（另有 --verify / --coverage）
   localize_ini.py          只翻译 OptiScaler.ini 的注释行
   render_notes.py          用环境变量填充 Release 说明模板
+  verify_binary.py         产物级校验：在编译出的 DLL 里找 UTF-8 中文字节
   dict_v10.json            C++ 字面量字典（1450 条）
   dict_ini.json            ini 注释字典
+  coverage-baseline.json   覆盖率基线（上游 SHA + translated/total），漂移报警的锚
   sample_OptiScaler.ini    ci-check 用的小样本
   msyh_cjk.ttf             已提交的字体子集（551 KB，920 码位），CI 的第一级字体源
+  selftests/
+    menu_common_fixture.cpp  锚点漂移回归用的最小夹具
+    run_drift_selftest.py    8 例漂移回归（完好/漂移/半注入/重缩进）
 ```
 
-Release 说明是模板 + 环境变量填出来的（`render_notes.py`）：模板里的 `{{UPSTREAM_SHA}}` 等占位符必须全部被替换，残留一个就构建失败。`gh release list` 的跳过判定读的就是渲染结果里的 `upstream-sha:` 那一行。
+Release 说明是模板 + 环境变量填出来的（`render_notes.py`）：模板里的 `{{UPSTREAM_SHA}}`、`{{COVERAGE}}` 等占位符必须全部被替换，残留一个就构建失败。跳过判定读的就是渲染结果里的 `upstream-sha:` 那一行（通过 `gh api .../releases` 取回来，因为 `gh` 的 release 列表子命令不返回 body）。
 
 ---
 
@@ -246,8 +280,9 @@ Release 说明是模板 + 环境变量填出来的（`render_notes.py`）：模�
 ## 已知限制
 
 - **只覆盖主菜单**：`OptiScaler/menu/*.cpp` 里的 UI 字面量。overlay 提示、后端日志等文案未翻译。
-- **约 75% 的有效覆盖**：`std::format` 动态拼接出来的字符串（如 `std::format("{} Doesn't support more than {}x", ...)`）无法整串匹配，这类条目在字典里命中不到。
-- **`OptiScaler.ini` 只翻注释**：配置项（`key`、`[Section]`、取值）一律不动。注释字典 `tools_cn/dict_ini.json` 当前覆盖上游全部 902 条注释（696 个唯一 key），`--report` 会显示 `not in dictionary` 为 0；上游新增注释后未命中的行原样保留英文，用 `--report` 可以看未命中数。
+- **当前实测覆盖率 68.6%**（`translated=1223` / `total=1783`，上游 master `572a09c`）。除下面说的 `std::format` 动态拼接外，上游新增的字面量要等字典跟上，未跟上的条目显示英文。
+- **`std::format` 动态拼接的串译不了**：像 `std::format("{} Doesn't support more than {}x", ...)` 这种运行时才成形的串无法整串匹配，字典里对应条目在源码中命中不到。
+- **`OptiScaler.ini` 只译注释**：配置项（`key`）、`[Section]`、取值一律不动，注释的译文由 `tools_cn/dict_ini.json` 提供。INI 注释侧覆盖上游全部 902 条注释（696 个唯一 key），`--report` 会显示 `not in dictionary` 为 0；上游新增注释而字典未跟进时，原文保留英文，`--report` 可以看到未命中数。**注意口径**：902 条是「INI 注释行」，与上面 UI 字符串侧的 68.6%（1223/1783）是两套不同的统计对象，不可相加、也不可互相换算。
 - **FPS overlay 缺字**：如果游戏或用户自定义了 overlay 字体，中文字符不在那个字体里，会显示成方块。内置字体子集只保证本补丁自己创建的字体 atlas 里有字。
 - **只支持 Windows x64**：构建产物是 `Release|x64`。
 - **产物是覆盖补丁**：不能单独使用，必须先有上游官方包。
