@@ -18,6 +18,11 @@ on:
         description: 'Rebuild even if this upstream commit was already released'
         type: boolean
         default: false
+      upstream_ref:
+        description: 'Upstream tag or branch to build (default: master, i.e. the latest nightly)'
+        type: string
+        required: false
+        default: ''
   schedule:
     # Daily check whether upstream moved; the job exits early when it did not.
     - cron: '0 6 * * *'
@@ -33,7 +38,10 @@ env:
   SOLUTION_FILE_PATH: src/OptiScaler.sln
   BUILD_CONFIGURATION: Release
   UPSTREAM_REPOSITORY: optiscaler/OptiScaler
-  UPSTREAM_REF: master
+  # Empty input means "master", i.e. the latest nightly. The `|| 'master'`
+  # fallback is required: a `schedule` run has no `inputs` context at all, so
+  # `inputs.upstream_ref` evaluates to an empty string there.
+  UPSTREAM_REF: ${{ inputs.upstream_ref || 'master' }}
   # Three level font fallback, implemented in tools_cn/build_font.py:
   #   tools_cn/msyh_cjk.ttf  ->  C:\Windows\Fonts\msyh.ttc  ->  hard error
   # The font step only passes --source when WINDOWS_FONT actually exists on the
@@ -54,6 +62,33 @@ jobs:
         with:
           path: self
           fetch-depth: 1
+
+      # Fail fast on a ref that does not exist upstream, before the 1.49 GB
+      # checkout runs. `actions/checkout` reports an unknown ref only as
+      # `fatal: couldn't find remote ref <ref>` buried in its own log, and the
+      # most likely bad input is a resource.h macro version such as
+      # `v10.0.0-pre1` -- that string is what the macros on master currently
+      # spell out (10.0.0 / build 1), but it is not a tag, so it must not be
+      # mistaken for one. `gh api` is used rather than git because a failed
+      # checkout can leave src/ missing or empty. GH_REPO is set like every
+      # other gh step so no call depends on which checkout the cwd is in; the
+      # API path below carries owner/repo explicitly, so it addresses the
+      # upstream repository regardless of that setting.
+      - name: Validate the requested upstream ref
+        if: inputs.upstream_ref != ''
+        shell: pwsh
+        env:
+          GH_REPO: ${{ github.repository }}
+          TARGET: ${{ inputs.upstream_ref }}
+          UPSTREAM_REPOSITORY: ${{ env.UPSTREAM_REPOSITORY }}
+        run: |
+          $sha = gh api "repos/$env:UPSTREAM_REPOSITORY/commits/$env:TARGET" --jq '.sha' 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::upstream ref '$env:TARGET' does not exist in $env:UPSTREAM_REPOSITORY."
+            Write-Host "::error::'v10.0.0-pre1' style values are resource.h macro versions on master, not tags. Leave the input empty to build the latest nightly, or pass a real tag such as v0.9.4."
+            exit 1
+          }
+          Write-Host "requested upstream ref $env:TARGET resolves to $sha"
 
       # No actions/cache here on purpose. Restoring src/.git/modules before the
       # checkout looks like it would save the ~1.49 GB submodule fetch, but
@@ -78,6 +113,8 @@ jobs:
       - name: Resolve upstream revision
         id: upstream
         shell: pwsh
+        env:
+          UPSTREAM_REF: ${{ env.UPSTREAM_REF }}
         run: |
           $sha = (git -C src rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($sha)) {
@@ -86,6 +123,12 @@ jobs:
           }
           $describe = (git -C src describe --tags --always).Trim()
           if ([string]::IsNullOrWhiteSpace($describe)) { $describe = "unknown" }
+          # When the operator pinned a tag, describe should report that tag
+          # rather than a bare short SHA: `fetch-depth: 1` carries no tag
+          # objects, so `git describe --tags` degrades to the abbreviated SHA.
+          if ($env:UPSTREAM_REF -and $env:UPSTREAM_REF -ne "master") {
+            $describe = $env:UPSTREAM_REF
+          }
           "sha=$sha" >> $env:GITHUB_OUTPUT
           "describe=$describe" >> $env:GITHUB_OUTPUT
           Write-Host "upstream sha      : $sha"
@@ -106,19 +149,40 @@ jobs:
           else {
             $marker = "upstream-sha: $env:UPSTREAM_SHA"
             $found = ""
+            # The marker is the commit SHA, so a tag build is covered by the same
+            # logic: the tag resolves to a commit, and rebuilding that tag skips
+            # correctly. When a tag and master point at the same commit they are
+            # the same product, which is intended -- use `force` to rebuild.
+            #
             # GH_REPO pins gh to this repository: the workspace holds two git
             # checkouts (self/ and src/) and gh would otherwise guess wrong.
-            $raw = gh release list --limit 30 --json tagName,body 2>$null
-            if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($raw)) {
-              $releases = $raw | ConvertFrom-Json
-              # The tag prefix is deliberately specific: a plain "zh-cn-*" would
-              # also match the "zh-cn-signed-*" tags, so publishing a signed
-              # build would make this unsigned workflow skip the same commit.
-              foreach ($rel in $releases) {
-                if ($null -ne $rel.body -and $rel.body -like "*$marker*" -and $rel.tagName -like "zh-cn-OptiScaler_*") {
-                  $found = $rel.tagName
-                  break
-                }
+            #
+            # The releases API is queried directly instead of the `gh` list
+            # subcommand: that subcommand has no `body` field at all and fails
+            # outright with `Unknown JSON field: "body"` (its available fields
+            # are createdAt, isDraft, isImmutable, isLatest, isPrerelease, name,
+            # publishedAt and tagName). The failure used to be hidden by
+            # redirecting stderr to null, which left $raw empty and took the
+            # "no release yet" branch -- so the log looked healthy while
+            # $LASTEXITCODE stayed at 1 and failed the whole step, and the skip
+            # check could never match a marker. Redirecting stderr into stdout
+            # puts the error text into the log instead of swallowing it, and a
+            # failure exits immediately rather than pretending to succeed.
+            $raw = gh api "repos/$env:GH_REPO/releases?per_page=30" --jq '[.[] | {tag: .tag_name, body: .body}]' 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::could not list releases: $raw"
+              exit 1
+            }
+            # `--jq` prints nothing for a repository without releases and a JSON
+            # array otherwise; normalise both to something the foreach can walk.
+            $releases = if ([string]::IsNullOrWhiteSpace($raw)) { @() } else { $raw | ConvertFrom-Json }
+            # The tag prefix is deliberately specific: a plain "zh-cn-*" would
+            # also match the "zh-cn-signed-*" tags, so publishing a signed
+            # build would make this unsigned workflow skip the same commit.
+            foreach ($rel in $releases) {
+              if ($null -ne $rel.body -and $rel.body -like "*$marker*" -and $rel.tag -like "zh-cn-OptiScaler_*") {
+                $found = $rel.tag
+                break
               }
             }
             if ($found) {
@@ -137,6 +201,11 @@ jobs:
               Write-Host "no release yet for upstream $env:UPSTREAM_SHA"
             }
           }
+          # PowerShell 7 keeps $LASTEXITCODE across statements and converts a
+          # leftover non-zero value into a step failure at the end of the step.
+          # Everything that must fail has already exited above, so clear it
+          # explicitly instead of relying on the last external command.
+          $global:LASTEXITCODE = 0
           "skip=$skip" >> $env:GITHUB_OUTPUT
 
       - name: Set up Python
@@ -224,6 +293,7 @@ jobs:
         shell: pwsh
         env:
           UPSTREAM_DESCRIBE: ${{ steps.upstream.outputs.describe }}
+          UPSTREAM_REF: ${{ env.UPSTREAM_REF }}
         run: |
           $defines = @{}
           $names = @("VER_MAJOR_VERSION", "VER_MINOR_VERSION", "VER_HOTFIX_VERSION", "VER_BUILD_NUMBER")
@@ -249,7 +319,23 @@ jobs:
             }
           }
 
-          if ($defines.Count -eq $names.Count) {
+          # Priority 1: an explicitly requested tag wins over the macros. The
+          # macros only describe the commit they sit on, so on master they read
+          # 10.0.0 / build 1 ("v10.0.0-pre1", the current nightly) while every
+          # released tag carries its own numbers -- building v0.9.4 with the
+          # macro path would be right only by coincidence. Preferring the
+          # requested tag keeps the asset name matching what was asked for.
+          # Priority 2: the four resource.h macros (the normal master build).
+          # Priority 3: git describe, so an older snapshot without the macros
+          # still produces a name instead of failing the build.
+          if ($env:UPSTREAM_REF -and $env:UPSTREAM_REF -ne "master") {
+            # Strip a single leading "v" and re-add it, so both "v0.9.4" and
+            # "0.9.4" end up as "v0.9.4" and never as "vv0.9.4".
+            $tag = $env:UPSTREAM_REF -replace '^v', ''
+            $version = "v$tag"
+            Write-Host "version taken from the requested upstream ref $env:UPSTREAM_REF"
+          }
+          elseif ($defines.Count -eq $names.Count) {
             $version = "v$($defines['VER_MAJOR_VERSION']).$($defines['VER_MINOR_VERSION']).$($defines['VER_HOTFIX_VERSION'])-pre$($defines['VER_BUILD_NUMBER'])"
             Write-Host "version taken from the source macros"
           }
@@ -260,6 +346,10 @@ jobs:
             $missing = ($names | Where-Object { -not $defines.ContainsKey($_) }) -join ", "
             Write-Host "::warning::version macros not found ($missing), falling back to git describe"
             $safe = ($env:UPSTREAM_DESCRIBE -replace '[^0-9A-Za-z._-]', '_')
+            # `git describe` normally returns "v0.9.2-12-g429af9c", so the
+            # leading "v" has to go before one is prepended again -- otherwise
+            # the asset name reads "vv0.9.2-12-g429af9c".
+            $safe = $safe -replace '^v', ''
             if ([string]::IsNullOrWhiteSpace($safe)) { $safe = "unknown" }
             $version = "v$safe"
           }
@@ -483,9 +573,32 @@ jobs:
           UPSTREAM_DESCRIBE: ${{ steps.upstream.outputs.describe }}
           VERSION: ${{ steps.version.outputs.version }}
           ARCHIVE: ${{ steps.version.outputs.archive }}
+          UPSTREAM_REF: ${{ env.UPSTREAM_REF }}
         run: |
           $env:BUILD_DATE = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd")
-          python self/tools_cn/render_notes.py --template self/.github/release-notes-auto.md --out dist/notes.md --require UPSTREAM_SHA UPSTREAM_DESCRIBE BUILD_DATE ARCHIVE VERSION
+          # render_notes.py fails when a placeholder in the template has no
+          # value, so BUILD_TARGET_NOTICE must be set on both branches -- the
+          # master build gets its own notice rather than an empty string.
+          # An array joined with "`n" is used instead of a here-string: a
+          # here-string terminator has to sit in column 1, which would break
+          # out of the YAML block scalar this script lives in. Single-quoted
+          # strings leave the Markdown backticks alone, so they need no
+          # doubling and render as one backtick each.
+          if ($env:UPSTREAM_REF -and $env:UPSTREAM_REF -ne "master") {
+            $notice = @(
+              ('> **构建目标**：上游 tag `' + $env:UPSTREAM_REF + '`（历史版本）。'),
+              '> 汉化字典基于 `master` 编写；该版本中措辞已被上游改动的注释会保留英文原文，',
+              '> 因此本包的中文完整度低于夜间测试版。配置项与取值不受影响。'
+            ) -join "`n"
+          }
+          else {
+            $notice = @(
+              '> **构建目标**：上游 `master` 最新提交（夜间测试版）。',
+              '> 汉化字典与本版本同步维护，注释完整度最高。'
+            ) -join "`n"
+          }
+          $env:BUILD_TARGET_NOTICE = $notice.Trim()
+          python self/tools_cn/render_notes.py --template self/.github/release-notes-auto.md --out dist/notes.md --require UPSTREAM_SHA UPSTREAM_DESCRIBE BUILD_DATE ARCHIVE VERSION BUILD_TARGET_NOTICE
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload the build artifacts

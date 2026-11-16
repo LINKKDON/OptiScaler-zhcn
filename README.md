@@ -143,6 +143,21 @@ python tools_cn/localize_ini.py --ini <上游 OptiScaler.ini> --lint-dict # 字�
 | `build_zhcn_signed.yml` (`Build Chinese (Signed)`) | 仅手动 dispatch | 同上去加 SignPath 签名，发布签名版 Release |
 | `ci-check.yml` (`CI`) | 本仓库 push / PR | 秒级自检：py_compile、stb 往返、字典校验、ini 校验、YAML 可解析、无 BOM/CRLF/tab |
 
+### 手动 dispatch 的两个输入
+
+两个构建工作流都有 `force` 与 `upstream_ref` 两个输入：
+
+| 输入 | 留空 | 填值 |
+| --- | --- | --- |
+| `upstream_ref` | 构建 `master` 最新提交，即**夜间测试版** | 构建指定的上游 tag，如 `v0.9.4` |
+| `force` | 该上游 commit 已发过 Release 就跳过 | 无视已有 Release，强制重建 |
+
+`upstream_ref` 留空时产物版本号从上游 `resource.h` 的四个宏读出来，跟着上游走：今天是 `v10.0.0-pre1`，上游把 `VER_BUILD_NUMBER` 改成 2 就自动变成 `v10.0.0-pre2`。填了 tag 就直接用 tag 名做版本号，不再读宏——宏只描述它所在的那个 commit，与 tag 未必对齐。
+
+**注意 `v10.0.0-pre1` 不是 tag。** 它是 `master` 上 `resource.h` 宏拼出来的版本号，上游的 tag 只有 `v0.9.4`、`v0.9.3`、`v0.9.2`、`v0.9.1`、`v0.9.0`、`v0.7.9`、`v0.7.8`、`v0.7.7-pre9`、`v0.7.0-pre66` 等。把 `v10.0.0-pre1` 填进 `upstream_ref` 会在第 2 步 `Validate the requested upstream ref` 就失败并给出提示，不会跑到 checkout 才报 `couldn't find remote ref`。
+
+**构建历史 tag 时汉化不完整。** 字典是按 `master` 的措辞写的；历史版本里被上游改过措辞的注释会保留英文原文，`localize_ini.py --report` 会把它们计入 `not in dictionary`。配置项与取值不受影响。Release 说明里会自动加一段中文提示说明这一点。
+
 `ci-check.yml` 共 10 步，最后一步只扫本仓库真正发布的路径（`tools_cn/`、`.github/`、`README.md`、`MIGRATION.md`、`LICENSE`、`.gitignore`、`.gitattributes`），不去扫本机的临时工作目录。
 
 仓库带 `.gitattributes`（`* text=auto eol=lf`，二进制扩展名标 `binary`），`*.py` / `*.json` / `*.yml` / `*.md` 一律存 LF。就算有人在 CRLF 工作区提交，git 也会在入库时归一化——但别指望它兜底，最后那步扫描才是真正的防线。

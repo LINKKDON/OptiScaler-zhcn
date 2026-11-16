@@ -12,6 +12,8 @@ OptiScaler 安装目录（即上游官方包解压后的那个目录）覆盖同
 > SmartScreen 也可能拦截。这是预期行为，不是文件损坏。如果需要受信任的签名，
 > 请自行提交 VirusTotal 检验，或使用未签名的 `zh-cn-` 版本。
 
+{{BUILD_TARGET_NOTICE}}
+
 ## 上游信息 / upstream information
 
 | 项目 | 值 |

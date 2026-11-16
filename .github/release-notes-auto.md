@@ -8,6 +8,8 @@ OptiScaler 安装目录（即上游官方包解压后的那个目录）覆盖同
 
 覆盖前请先备份原文件。
 
+{{BUILD_TARGET_NOTICE}}
+
 ## 上游信息 / upstream information
 
 | 项目 | 值 |
