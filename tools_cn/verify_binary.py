@@ -36,6 +36,15 @@ import argparse
 import sys
 from pathlib import Path
 
+# Windows runners (and most non-Unix hosts) do not default stdout/stderr to
+# UTF-8. The assertions below print the matched Chinese string, so without
+# this reconfigure the whole step crashes with UnicodeEncodeError on a build
+# that actually succeeded. Keep this at import time, before any print().
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 
 def find_all(haystack: bytes, needle: bytes) -> list:
     """Return every offset at which *needle* occurs in *haystack*."""

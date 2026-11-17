@@ -73,6 +73,39 @@ jobs:
           fi
           echo "verify_binary.py self test OK"
 
+      - name: Legacy code page stdout guard
+        # The Windows build runner hands Python a cp1252 stdout. Every tool in
+        # tools_cn prints Chinese on at least one diagnostic path, so a missing
+        # reconfigure() turns a *successful* check into UnicodeEncodeError and
+        # fails the step with a stack trace instead of a verdict. That already
+        # happened once (run 43832767932, step 15) and this job could not see it,
+        # because ubuntu-latest defaults to UTF-8. Force the legacy code page
+        # here so the guard is exercised on every push.
+        run: |
+          set -eu
+          tmp="$(mktemp -d)"
+          python3 - "$tmp" <<'PY'
+          import pathlib
+          import sys
+          root = pathlib.Path(sys.argv[1])
+          root.joinpath('good.dll').write_bytes(
+              b'MZ' + b'\x00' * 64 + '重投影设置'.encode('utf-8') + b'\x00' * 16)
+          PY
+          export PYTHONIOENCODING=cp1252
+          python3 tools_cn/verify_binary.py --dll "$tmp/good.dll" \
+            --expect-utf8 "重投影设置"
+          # A miss must still exit non-zero with a readable message, not a crash.
+          if python3 tools_cn/verify_binary.py --dll "$tmp/good.dll" \
+               --expect-utf8 "正在打开 ImGui"; then
+            echo "ERROR: verify_binary.py accepted a missing string" >&2
+            exit 1
+          fi
+          # The other tools must at least survive --help under the legacy page.
+          for tool in localize.py localize_ini.py build_font.py render_notes.py; do
+            python3 "tools_cn/$tool" --help > /dev/null
+          done
+          echo "legacy code page stdout guard OK"
+
       - name: Validate the translation dictionary
         run: python3 tools_cn/localize.py --check-dict --tools tools_cn
 

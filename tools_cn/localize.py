@@ -27,6 +27,21 @@ from pathlib import Path
 
 import argparse
 
+
+def _force_utf8_stdio() -> None:
+    """Make print() safe on hosts whose stdio defaults to a legacy code page.
+
+    Windows runners hand Python a cp1252 stdout, but several diagnostics below
+    print dictionary keys and Chinese values. Without this, a *failing* check
+    dies with UnicodeEncodeError and hides the real message.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+_force_utf8_stdio()
+
 REPO = Path(".")
 MENU = Path(".")
 DICT_PATH = Path("dict_v10.json")

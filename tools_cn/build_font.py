@@ -29,6 +29,21 @@ import sys
 import tempfile
 from pathlib import Path
 
+
+def _force_utf8_stdio() -> None:
+    """Make print() safe on hosts whose stdio defaults to a legacy code page.
+
+    The missing-glyph report below prints the CJK characters themselves, so on
+    a cp1252 console it would crash exactly when it has something important to
+    say. Reconfigure once at import time.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+_force_utf8_stdio()
+
 HERE = Path(__file__).resolve().parent
 
 MENU: Path | None = None

@@ -26,6 +26,21 @@ from pathlib import Path
 PLACEHOLDER = re.compile(r"\{\{([A-Z0-9_]+)\}\}")
 
 
+def _force_utf8_stdio() -> None:
+    """Make print() safe on hosts whose stdio defaults to a legacy code page.
+
+    Diagnostics echo template placeholders and the Chinese notes themselves, so
+    an error path must not die with UnicodeEncodeError.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+_force_utf8_stdio()
+
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Render the release notes template")
     ap.add_argument("--template", type=Path, required=True)

@@ -43,6 +43,21 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+
+
+def _force_utf8_stdio() -> None:
+    """Make print() safe on hosts whose stdio defaults to a legacy code page.
+
+    The guard diagnostics below echo comment bodies, which are Chinese on an
+    already localized file. Without this, a failing check dies with
+    UnicodeEncodeError and hides the actual reason.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+_force_utf8_stdio()
 DEFAULT_DICT = HERE / "dict_ini.json"
 
 # A comment made only of rule characters is a visual separator and is never
