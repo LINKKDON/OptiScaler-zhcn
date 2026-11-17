@@ -568,7 +568,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::git ls-tree failed"; exit 1 }
           foreach ($required in @(
               "OptiScaler/menu/menu_common.cpp",
-              "OptiScaler/OptiScaler.ini",
+              "OptiScaler.ini",
               "OptiScaler/menu/font/CJK_Compressed.h")) {
             if ($tracked -notcontains $required) {
               Write-Host "::error::$required is not in the commit that the source bundle is built from; an ignore rule or a failed generator dropped it"
