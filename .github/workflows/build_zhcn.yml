@@ -492,7 +492,7 @@ jobs:
           Write-Host "archive contents:"
           7z l "$archive"
 
-      - name: Collect the GPL-3.0 corresponding source
+      - name: Write the corresponding-source pointer (GPL-3.0 section 6)
         if: steps.check.outputs.skip != 'true'
         shell: pwsh
         env:
@@ -513,16 +513,16 @@ jobs:
           $lines = @(git -C src submodule status --recursive)
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          # `git archive HEAD` exports the commit tree, not the working
-          # directory, so the localized sources would be missing from the bundle
-          # unless they are committed first: menu_common.cpp would ship as the
-          # pristine English file, OptiScaler.ini as the English original, and
-          # the freshly generated OptiScaler/menu/font/CJK_Compressed.h would not
-          # be in the bundle at all. A throwaway commit on top of the upstream
-          # checkout freezes the patched tree into the object store. The upstream
-          # SHA the release notes advertise was captured earlier by the
-          # `Resolve upstream revision` step and is written to upstream-sha.txt
-          # at the end of this step, so the skip check keeps working tomorrow.
+          # The overlay commit below is what makes the pointer honest. GPL-3.0
+          # section 6 asks for the source *of what is distributed*, and the
+          # distributed binary is built from the patched tree, not from the
+          # pristine upstream commit. Committing the three patched files on top
+          # of the upstream checkout gives that tree a real commit id, so a third
+          # party can reproduce the binary exactly. Without it the pointer would
+          # name only the upstream commit and silently omit the localization.
+          # The upstream SHA the release notes advertise was captured earlier by
+          # the `Resolve upstream revision` step and is written to
+          # upstream-sha.txt below, so the skip check keeps working tomorrow.
           # Build products stay out of that commit because the upstream
           # .gitignore already covers x64/, [Rr]elease/, *.dll, *.pdb, *.obj,
           # *.lib, *.log, *.user plus the MSBuild generated
@@ -544,7 +544,16 @@ jobs:
             if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not commit the localization overlay"; exit 1 }
           }
           else {
-            Write-Host "no working tree change to commit; the bundle holds the pristine upstream tree"
+            Write-Host "no working tree change to commit; the tree already equals upstream"
+          }
+          # The overlay commit only ever exists on the runner, so the pointer
+          # cannot rely on it being fetchable. Its diff against the upstream
+          # commit is therefore written to dist/overlay.patch below; that patch
+          # plus the upstream commit reproduces the tree byte for byte.
+          $overlaySha = (git -C src rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($overlaySha)) {
+            Write-Host "::error::could not resolve the overlay commit id"
+            exit 1
           }
           # The bundle must be verifiably the patched tree: anything left
           # uncommitted would silently drop out of the archive, so a non-empty
@@ -576,36 +585,79 @@ jobs:
             }
           }
 
-          # GPL-3.0 section 6: whoever distributes the binary must also make the
-          # corresponding source available. Corresponding source covers the
-          # linked submodules too, so `git -C src archive HEAD` alone is not
-          # enough -- it only contains the top-level tree plus the gitlink
-          # entries. (The top-level tree itself is complete: the overlay commit
-          # above put the localized sources and the generated font header into
-          # HEAD, which is why the archive below holds the patched code rather
-          # than the pristine upstream files. What is still missing is the
-          # content *behind* each gitlink.) Every initialised submodule is
-          # therefore archived at its own path inside the bundle as well.
-          $stage = Join-Path $dist "source"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          # `--output` is used instead of a shell redirect so git writes the bytes
+          # itself: piping through PowerShell would re-encode the UTF-8 Chinese
+          # literals. `--binary` keeps the patch applicable even if a future
+          # generator emits a file git considers binary.
+          $patch = Join-Path $dist "overlay.patch"
+          if (Test-Path -LiteralPath $patch) { Remove-Item $patch -Force }
+          git -C src diff --binary --output="$patch" $env:UPSTREAM_SHA HEAD
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not write the overlay patch"; exit 1 }
+          if (-not (Test-Path -LiteralPath $patch) -or (Get-Item $patch).Length -eq 0) {
+            Write-Host "::error::the overlay patch is empty; the binary would not be reproducible from the pointer"
+            exit 1
+          }
+          Write-Host ("overlay.patch  {0} bytes ({1:N1} KB)  {2} -> {3}" -f `
+            (Get-Item $patch).Length, ((Get-Item $patch).Length / 1KB), $env:UPSTREAM_SHA, $overlaySha)
 
-          # 1. the main repository
-          git -C src archive --format=zip -o "$dist/main.zip" HEAD
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Expand-Archive "$dist/main.zip" -DestinationPath $stage -Force
-          Remove-Item "$dist/main.zip"
+          # GPL-3.0 section 6 asks for the corresponding source of what is
+          # distributed. A full snapshot is not required when every input is a
+          # public, immutable git object: a pointer that names the exact commits
+          # *is* the corresponding source, as long as those objects stay
+          # reachable. The snapshot this workflow used to build weighed 565 MB,
+          # of which roughly 500 MB were prebuilt DLLs and documentation trees
+          # from the two FidelityFX SDK checkouts -- material that is not even
+          # compiled into the product. The release therefore ships SOURCE.md and
+          # submodule-shas.txt instead.
+          #
+          # The pointer has to name exactly what this build consumed:
+          #   * the upstream commit, captured before the overlay commit,
+          #   * every submodule at the commit that is actually checked out,
+          #   * the files the localization steps rewrote.
+          $shaPath = Join-Path $dist "submodule-shas.txt"
+          if (Test-Path $shaPath) { Remove-Item $shaPath -Force }
 
-          # 2. every initialised submodule, archived into its own path.
-          # `submodule status --recursive` is used instead of parsing
-          # .gitmodules because .gitmodules only declares the direct children;
-          # nested submodules would silently be missing from the bundle. The
-          # leading status character tells whether a work tree exists at all:
-          # '-' means the submodule was never initialised (git only knows the
-          # recorded SHA), so it cannot be archived and is skipped loudly.
+          # path -> url, read from the checkout's .gitmodules so the pointer
+          # stays correct when upstream adds, removes or renames a submodule.
+          # A missing or unparsable entry is only a warning: the pointer falls
+          # back to "see .gitmodules" for that row and the build still ships.
+          $urls = @{}
+          $gitmodules = Join-Path $srcRoot ".gitmodules"
+          if (Test-Path -LiteralPath $gitmodules) {
+            $cfg = @(git -C src config -f $gitmodules --get-regexp '^submodule\..*\.(path|url)$')
+            if ($cfg.Count -eq 0) {
+              Write-Host "::warning::could not read submodule paths/urls from .gitmodules; the pointer will not list urls"
+            }
+            $pending = @{}
+            foreach ($line in $cfg) {
+              if ($line -match '^submodule\.(.+?)\.(path|url)\s+(.+)$') {
+                $name = $Matches[1]; $key = $Matches[2]; $val = $Matches[3].Trim()
+                if (-not $pending.ContainsKey($name)) { $pending[$name] = @{} }
+                $pending[$name][$key] = $val
+              }
+            }
+            foreach ($name in @($pending.Keys)) {
+              $entry = $pending[$name]
+              if ($entry.ContainsKey("path") -and $entry.ContainsKey("url")) {
+                $urls[$entry["path"]] = $entry["url"]
+              }
+            }
+          }
+          else {
+            Write-Host "::warning::no .gitmodules in the checkout; the source pointer will not list submodule urls"
+          }
+
+          # Every initialised submodule is listed at the commit that is actually
+          # checked out. `submodule status --recursive` is used instead of
+          # parsing .gitmodules because .gitmodules only declares the direct
+          # children; nested submodules would silently be missing. The leading
+          # status character tells whether a work tree exists at all: '-' means
+          # the submodule was never initialised (git only knows the recorded
+          # SHA), so it cannot be resolved and is skipped loudly.
           # $lines was captured before the overlay commit; see the comment there.
           $shas = Join-Path $dist "submodule-shas.txt"
           if (Test-Path $shas) { Remove-Item $shas -Force }
-          $archived = 0
+          $rows = @()
           foreach ($line in $lines) {
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
             if ($line -notmatch '^([ +\-U])([0-9a-f]{40,64}) (\S.*?)(?: \([^)]*\))?$') {
@@ -616,12 +668,12 @@ jobs:
             $recordedSha = $Matches[2]
             $p = $Matches[3]
             if ($state -eq '-') {
-              Write-Host "::warning::submodule $p is not initialized, skipped from the source bundle"
+              Write-Host "::warning::submodule $p is not initialized, left out of the source pointer"
               continue
             }
             $target = Join-Path $srcRoot $p
             if (-not (Test-Path -LiteralPath $target)) {
-              Write-Host "::warning::submodule path $p does not exist on disk, skipped"
+              Write-Host "::warning::submodule path $p does not exist on disk, left out of the source pointer"
               continue
             }
             $subSha = (git -C $target rev-parse HEAD).Trim()
@@ -629,30 +681,16 @@ jobs:
               Write-Host "::error::could not resolve the checked out commit of submodule $p"
               exit 1
             }
-            $out = Join-Path $dist ("sub-" + ($p -replace '[\\/]', '-') + ".zip")
-            git -C $target archive --format=zip -o $out HEAD
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            $dest = Join-Path $stage $p
-            New-Item -ItemType Directory -Force -Path $dest | Out-Null
-            Expand-Archive $out -DestinationPath $dest -Force
-            Remove-Item $out
             $note = ""
             if ($subSha -ne $recordedSha) { $note = "  (recorded $recordedSha, checked out $subSha)" }
             Add-Content -Path $shas -Value "$p $subSha$note"
-            Write-Host "archived submodule $p @ $subSha$note"
-            $archived++
+            $url = if ($urls.ContainsKey($p)) { $urls[$p] } else { "" }
+            $rows += [pscustomobject]@{ Path = $p; Url = $url; Sha = $subSha; Recorded = $recordedSha }
+            Write-Host "source pointer lists submodule $p @ $subSha$note"
           }
-          if ($archived -eq 0) {
-            Write-Host "::warning::no submodule was archived; corresponding-source.zip only holds the main repository"
+          if ($rows.Count -eq 0) {
+            Write-Host "::warning::no submodule was resolved; the source pointer only names the main repository"
           }
-
-          # Compress-Archive is documented to choke on entries above 2 GB; the
-          # whole source tree is ~1.5 GB before compression, so the merged zip
-          # stays far below that. The size check below makes a surprise loud
-          # instead of leaving a corrupt release attachment behind.
-          $bundle = Join-Path $dist "corresponding-source.zip"
-          Compress-Archive -Path "$stage\*" -DestinationPath $bundle -Force
-          Remove-Item $stage -Recurse -Force
 
           # Written from the pre-overlay snapshot for the same reason as
           # upstream-sha.txt: after `git add -A` the index may describe the
@@ -665,11 +703,76 @@ jobs:
           # still recognises this commit as already released.
           $env:UPSTREAM_SHA | Out-File -FilePath "$dist/upstream-sha.txt" -Encoding utf8
 
-          $size = (Get-Item $bundle).Length
-          Write-Host ("corresponding-source.zip  {0} bytes ({1:N1} MB)" -f $size, ($size / 1MB))
-          if ($size -gt 1.5GB) {
-            Write-Host "::warning::corresponding-source.zip is larger than 1.5 GB; GitHub release assets are limited to 2 GB per file"
+          # SOURCE.md is the GPL-3.0 section 6 deliverable. Built as a list of
+          # lines joined with "`n": a here-string terminator has to sit in
+          # column 1, which would break out of the YAML block scalar.
+          $upstreamRepo = "https://github.com/$env:UPSTREAM_REPOSITORY"
+          $md = @(
+            '# 对应源码 / Corresponding source',
+            '',
+            '本包分发的是上游 OptiScaler 的汉化覆盖构建（overlay build）。',
+            '按照 GPL-3.0 第 6 条，对应源码通过下面的**指针**给出，而不是随包附带一份完整快照：',
+            '所有输入都是公开、不可变的 git 对象，按 commit 即可逐字节复现本包。',
+            '',
+            '## 主仓库',
+            '',
+            ('- 仓库：<' + $upstreamRepo + '>'),
+            ('- commit：`' + $env:UPSTREAM_SHA + '`'),
+            ('- 复现：`git clone ' + $upstreamRepo + ' && git -C OptiScaler checkout ' + $env:UPSTREAM_SHA + '`'),
+            '',
+            '## 子模块',
+            '',
+            '上游 `.gitmodules` 声明的子模块，均按下列 commit 检出（与本包构建时一致）：',
+            '',
+            '| 路径 | commit | 仓库 |',
+            '| --- | --- | --- |'
+          )
+          foreach ($r in $rows) {
+            $link = if ($r.Url) { '<' + $r.Url + '>' } else { '（见 .gitmodules）' }
+            $md += ('| `' + $r.Path + '` | `' + $r.Sha + '` | ' + $link + ' |')
           }
+          $md += @(
+            '',
+            '初始化：`git submodule update --init --recursive`（在检出的主仓库根目录执行）。',
+            '',
+            '## 汉化补丁',
+            '',
+            ('本包对应的补丁是同一 Release 里的 `overlay.patch`（`git diff ' + $env:UPSTREAM_SHA.Substring(0, 9) + ' HEAD`，二进制安全）。'),
+            '在上游 commit 的检出上应用它，得到的就是编译本包的确切源码树：',
+            '',
+            '```bash',
+            'git clone ' + $upstreamRepo,
+            'cd OptiScaler',
+            ('git checkout ' + $env:UPSTREAM_SHA),
+            'git submodule update --init --recursive',
+            'git apply --binary overlay.patch',
+            '```',
+            '',
+            '补丁只涉及三个文件（见下节）。它之所以必要：汉化在构建期注入，产物来自打过补丁的树，而不是原始上游 commit；',
+            '只有 commit id + 补丁合起来才唯一确定这份二进制。',
+            '',
+            '## 补丁涉及的文件',
+            '',
+            '| 文件 | 改动 |',
+            '| --- | --- |',
+            '| `OptiScaler/menu/menu_common.cpp` | UI 字符串按 `tools_cn/dict_v10.json` 替换为中文；在字体初始化处插入 CJK 合并块 |',
+            '| `OptiScaler.ini` | 仅注释行翻译，配置项与取值逐字节不变 |',
+            '| `OptiScaler/menu/font/CJK_Compressed.h` | 新增文件，内嵌的 CJK 字体子集（由 `tools_cn/build_font.py` 生成） |',
+            '',
+            '脚本与字典见 <https://github.com/LINKKDON/OptiScaler-zhcn>：',
+            '',
+            '- `tools_cn/localize.py` —— 注入译文与字体合并块',
+            '- `tools_cn/localize_ini.py` —— 仅翻译 INI 注释',
+            '- `tools_cn/build_font.py` —— 生成 `CJK_Compressed.h`',
+            '- `tools_cn/dict_v10.json`、`tools_cn/dict_ini.json` —— 翻译字典',
+            '',
+            '## 说明',
+            '',
+            '上游仓库、全部子模块与本仓库均公开可访问，任何第三方都能按上述 commit 与补丁取得完整源码。',
+            '若某个 commit 将来变得不可达，请提 issue，届时会改回随包附带完整源码快照。'
+          )
+          $md -join "`n" | Out-File -FilePath "$dist/SOURCE.md" -Encoding utf8
+          Write-Host ("SOURCE.md  {0} bytes, {1} submodule(s)" -f (Get-Item "$dist/SOURCE.md").Length, $rows.Count)
           Get-ChildItem dist | Format-Table Name, Length -AutoSize | Out-String | Write-Host
 
       - name: Render the release notes
@@ -730,7 +833,8 @@ jobs:
           if-no-files-found: error
           path: |
             dist/*.7z
-            dist/corresponding-source.zip
+            dist/SOURCE.md
+            dist/overlay.patch
             dist/submodules.txt
             dist/submodule-shas.txt
             dist/notes.md
@@ -759,7 +863,8 @@ jobs:
           # upstream actually declares initialised submodules.
           $assets = @(
             "dist/$env:ARCHIVE",
-            "dist/corresponding-source.zip",
+            "dist/SOURCE.md",
+            "dist/overlay.patch",
             "dist/submodules.txt",
             "dist/upstream-sha.txt"
           )

@@ -34,14 +34,21 @@ upstream-version: {{UPSTREAM_DESCRIBE}}
 ## 许可证 / License
 
 本产物是 OptiScaler 的衍生作品，OptiScaler 以 GNU General Public License v3.0 发布，
-因此本产物同样以 GPL-3.0 发布。按 GPL-3.0 第 6 条，本 Release 同时提供对应源码：
+因此本产物同样以 GPL-3.0 发布。按 GPL-3.0 第 6 条，本 Release 同时提供对应源码的**指针**：
 
-* `corresponding-source.zip` —— 上游 commit `{{UPSTREAM_SHA}}` 的完整源码快照，
-  含 `main/`（本仓库之外的 OptiScaler 主仓库）与 `submodules/`（递归子模块各自的源码）
+* `SOURCE.md` —— 说明如何用下面的 commit 与补丁重建本包的确切源码树（含 9 个子模块的
+  仓库地址与提交），并列出汉化补丁涉及的文件
+* `overlay.patch` —— 从上游 commit 到本包构建所用源码树的完整 diff（`git diff --binary`），
+  在上游 commit 的检出上 `git apply --binary` 即可复现
 * `submodules.txt` —— 递归子模块在构建开始时记录的版本（`git submodule status --recursive` 原样输出）
-* `submodule-shas.txt` —— 实际打进 `corresponding-source.zip` 的每个子模块路径与提交，
+* `submodule-shas.txt` —— 实际参与构建的每个子模块路径与提交，
   若与上游记录的版本不一致会标注 `(recorded …, checked out …)`
 * `upstream-sha.txt` —— 构建时使用的上游 commit
+
+之所以用指针而不是随包附带完整源码快照：本包的全部输入都是公开、不可变的 git 对象，
+按 commit + 补丁即可逐字节复现；而完整快照有 565 MB，其中约 500 MB 是两个 FidelityFX SDK
+子模块里的预编译 DLL 与文档，它们并不参与编译。若将来某个 commit 变得不可达，会改回随包
+附带完整快照。
 
 本仓库自身的脚本与工作流同样以 GPL-3.0 发布。
 许可证全文：<https://www.gnu.org/licenses/gpl-3.0.txt>

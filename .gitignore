@@ -51,3 +51,12 @@ _probe/
 # Local verification workspace: probe fixtures plus copies of upstream sources
 # and generated CJK headers (several MB). Never part of the repository.
 verify/
+
+# Local code-signing scratch: a throwaway pfx plus its plaintext password.
+# The real certificate is generated inside the CI job and never stored.
+codesign/
+*.pfx
+*.p12
+*.pem
+*.key
+pfx-password*

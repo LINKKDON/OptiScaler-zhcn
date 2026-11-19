@@ -1,13 +1,16 @@
 name: Build Chinese (Signed)
 
 # Same thin-repo build as build_zhcn.yml, but the produced OptiScaler.dll is
-# submitted to SignPath before packaging. Manual only: every run costs a signing
-# request against the signing service, so it is never scheduled.
+# signed with a self-signed code signing certificate before packaging. Manual
+# only: signing adds nothing to a nightly and the certificate is regenerated on
+# every run, so there is no point scheduling it.
 #
-# The SignPath project referenced in the env block below must have its GitHub
-# trusted build system bound to THIS repository (SignPath dashboard -> project
-# -> trusted build systems -> GitHub). The identifiers themselves are unchanged
-# from the fork; only the repository binding has to follow the move.
+# Why self-signed: the previous version submitted the artifact to SignPath,
+# which needed an API token secret and a trusted-build binding in the SignPath
+# dashboard for THIS repository. Neither existed here, so every run failed. A
+# certificate created in the job needs no external state at all, and the only
+# downside -- Windows shows "unknown publisher" -- is the same thing the
+# SignPath test certificate produced.
 
 on:
   workflow_dispatch:
@@ -23,10 +26,9 @@ on:
         default: ''
 
 permissions:
-  # contents: write publishes the release, actions: read lets the SignPath
-  # action download the workflow artifact it is asked to sign.
+  # contents: write publishes the release. Signing needs no extra permission:
+  # the certificate is created inside the job, so nothing is read from the API.
   contents: write
-  actions: read
 
 concurrency:
   group: build-zhcn-signed
@@ -41,15 +43,12 @@ env:
   # one has no schedule trigger.
   UPSTREAM_REF: ${{ inputs.upstream_ref || 'master' }}
   WINDOWS_FONT: C:\Windows\Fonts\msyh.ttc
-  # --- SignPath binding: re-bind these for this repository ---
-  SIGNPATH_ORGANIZATION_ID: d62571e9-818a-4296-bf46-46db55b1a44e
-  SIGNPATH_PROJECT_SLUG: OptiScaler
-  SIGNPATH_POLICY_SLUG: release-signing
-  # The policy id the old fork was granted; kept for reference and for the notes.
-  SIGNPATH_POLICY_ID: 08634ea0-3ec2-46df-8a03-755a138a1565
-  # No API base URL any more: the signing request goes through the official
-  # signpath/github-action-submit-signing-request action, not through a
-  # hand-written REST call.
+  # Signing is self-contained: a throwaway code signing certificate is created
+  # inside the job, used once, and destroyed with the runner. No secret, no
+  # third-party signing service, no dashboard binding. Windows will report
+  # "unknown publisher" because nothing chains to a trusted root -- that is the
+  # expected outcome of a self-signed certificate, not a build failure.
+  SIGNING_SUBJECT: CN=OptiScaler-zhcn (community build)
 
 jobs:
   build:
@@ -62,8 +61,7 @@ jobs:
     #    environment variable."
     # It is set once at job level rather than per step so a future gh call
     # cannot silently inherit the anonymous client again. `permissions:
-    # contents: write` above is what grants this token the right to publish;
-    # `actions: read` is what the SignPath action needs to fetch the artifact.
+    # contents: write` above is what grants this token the right to publish.
     # Reads of the upstream repository go through the same token; public
     # repositories are readable by any authenticated token.
     env:
@@ -388,89 +386,120 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       # ------------------------------------------------------------------
-      # SignPath, official trusted-build path
+      # Self-signed code signing
       #
-      # The artifact has to exist as a workflow artifact first and the signing
-      # request points at it by `github-artifact-id`; SignPath only accepts
-      # trusted-build submissions that way. The hand-written REST sequence this
-      # workflow used before (SubmitWithArtifact, polling /Status, downloading
-      # /SignedArtifact) is not accepted for a trusted build system.
+      # The certificate is created here, used here, and dies with the runner:
+      # nothing to store, nothing to rotate, nothing to bind in a dashboard.
+      # It is exported to a PFX with a random password only so `signtool` can
+      # read the private key; the file is removed before the job ends.
       #
-      # - v2 and v3 both run on node24 and differ only in their default
-      #   connector-url: v3 talks to the pipelineconnector endpoint, which is
-      #   the one a trusted build system must use. Do not downgrade to v2.
-      # - `output-artifact-directory` implies skip-decompress=false, so the
-      #   action expands the signed ZIP itself: the dll ends up at
-      #   dist/signed/OptiScaler.dll. No unzip step is needed here.
-      # - No continue-on-error on purpose: a failed signature fails the run
-      #   instead of shipping an unsigned binary under a "signed" tag.
+      # No continue-on-error on purpose: a run that cannot sign must fail
+      # rather than ship an unsigned binary under a "signed" tag.
       # ------------------------------------------------------------------
-      - name: Upload the unsigned dll for signing
-        id: upload-unsigned
-        if: steps.check.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: OptiScaler-zhcn-unsigned
-          path: src/x64/Release/a/OptiScaler.dll
-          if-no-files-found: error
-          compression-level: 9
-
-      - name: Submit the signing request to SignPath
-        id: signpath
-        if: steps.check.outputs.skip != 'true'
-        uses: signpath/github-action-submit-signing-request@v3
-        with:
-          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ env.SIGNPATH_ORGANIZATION_ID }}
-          project-slug: ${{ env.SIGNPATH_PROJECT_SLUG }}
-          signing-policy-slug: ${{ env.SIGNPATH_POLICY_SLUG }}
-          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
-          wait-for-completion: true
-          # The action defaults to 600 s; a manual approval in the SignPath
-          # policy can easily outlast that, and the job itself is allowed 90
-          # minutes, so the wait is raised to 1800 s.
-          wait-for-completion-timeout-in-seconds: 1800
-          output-artifact-directory: dist/signed
-
-      - name: Confirm the signature is present
+      - name: Create a self-signed code signing certificate
+        id: cert
         if: steps.check.outputs.skip != 'true'
         shell: pwsh
+        env:
+          SUBJECT: ${{ env.SIGNING_SUBJECT }}
         run: |
-          # Copy explicitly: everything downstream (packaging, the GPL source
-          # bundle, the uploaded artifact) must see one signed binary.
-          $signed = "dist/signed/OptiScaler.dll"
-          if (-not (Test-Path $signed)) {
-            # skip-decompress defaults to false, so the archive is extracted
-            # directly into the directory; a nested folder inside the ZIP would
-            # still land one level deeper, so fall back to a search.
-            $found = @(Get-ChildItem -Path dist/signed -Filter "OptiScaler.dll" -File -Recurse -ErrorAction SilentlyContinue)
-            if ($found.Count -ge 1) {
-              $signed = $found[0].FullName
-              Write-Host "signed dll found at $signed"
-            }
+          # `-Type CodeSigningCert` sets the EKU to 1.3.6.1.5.5.7.3.3, which is
+          # what signtool and Windows expect for an Authenticode signature.
+          # The certificate lands in Cert:\CurrentUser\My, which is where
+          # signtool looks when no /f is given, but a PFX is exported anyway so
+          # the exact certificate is pinned regardless of store contents.
+          $cert = New-SelfSignedCertificate `
+            -Type CodeSigningCert `
+            -Subject $env:SUBJECT `
+            -KeyUsage DigitalSignature `
+            -KeyExportPolicy Exportable `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -NotAfter (Get-Date).AddYears(2) `
+            -HashAlgorithm SHA256
+          if ($null -eq $cert) {
+            Write-Host "::error::New-SelfSignedCertificate returned nothing"
+            exit 1
           }
-          if (-not (Test-Path $signed)) {
-            Get-ChildItem -Path dist -Recurse -File -ErrorAction SilentlyContinue |
-              Select-Object -First 20 FullName | Format-Table -AutoSize | Out-String | Write-Host
-            Write-Host "::error::no signed OptiScaler.dll under dist/signed; the SignPath action did not produce one"
+          Write-Host "certificate thumbprint: $($cert.Thumbprint)"
+          Write-Host "certificate subject   : $($cert.Subject)"
+          Write-Host "certificate expires   : $($cert.NotAfter.ToUniversalTime().ToString('yyyy-MM-dd'))"
+
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $password = [guid]::NewGuid().ToString("N")
+          $pfx = "dist/signing.pfx"
+          $secure = ConvertTo-SecureString -String $password -Force -AsPlainText
+          Export-PfxCertificate -Cert $cert -FilePath $pfx -Password $secure | Out-Null
+          if (-not (Test-Path $pfx)) {
+            Write-Host "::error::could not export the signing certificate to $pfx"
             exit 1
           }
 
-          $dll = "src/x64/Release/a/OptiScaler.dll"
-          Copy-Item $signed $dll -Force
-          Write-Host ("signed OptiScaler.dll  {0} bytes" -f (Get-Item $dll).Length)
+          # The password only has to survive until the signing step, so it is
+          # handed over as a step output rather than written to disk: a file
+          # would have to be deleted again and could leak into the artifact
+          # upload if a later step failed.
+          "pfx=$pfx" >> $env:GITHUB_OUTPUT
+          "password=$password" >> $env:GITHUB_OUTPUT
+          "thumbprint=$($cert.Thumbprint)" >> $env:GITHUB_OUTPUT
+          Write-Host ("exported {0} ({1} bytes)" -f $pfx, (Get-Item $pfx).Length)
 
+      - name: Sign OptiScaler.dll
+        if: steps.check.outputs.skip != 'true'
+        shell: pwsh
+        env:
+          PFX: ${{ steps.cert.outputs.pfx }}
+          PFX_PASSWORD: ${{ steps.cert.outputs.password }}
+        run: |
+          # The Windows SDK is not on PATH on windows-latest, and the exact
+          # version directory changes with the image, so signtool is located by
+          # searching the Kits tree. Newest first: the SDK ships one folder per
+          # version and only the newest is guaranteed to understand /sha256.
+          $candidates = @(Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin" `
+            -Filter "signtool.exe" -File -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.DirectoryName -match '\\x64$' } |
+            Sort-Object -Property FullName -Descending)
+          if ($candidates.Count -eq 0) {
+            Write-Host "::error::signtool.exe not found under ${env:ProgramFiles(x86)}\Windows Kits\10\bin; cannot sign"
+            exit 1
+          }
+          $signtool = $candidates[0].FullName
+          Write-Host "signtool: $signtool"
+
+          $dll = "src/x64/Release/a/OptiScaler.dll"
+          if (-not (Test-Path $dll)) {
+            Write-Host "::error::$dll is missing; nothing to sign"
+            exit 1
+          }
+
+          # /fd sha256 and /td sha256 are both required: /td only applies to
+          # timestamping, and without /fd the digest defaults to sha1 on older
+          # SDK builds. No /tr is passed because a timestamp would need a
+          # network round trip to a TSA and a self-signed certificate gains
+          # nothing from one (the signature stays valid after expiry anyway
+          # only for trusted chains).
+          & $signtool sign /fd sha256 /f "$env:PFX" /p "$env:PFX_PASSWORD" /v $dll
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::signtool sign failed with exit code $LASTEXITCODE"
+            exit 1
+          }
+
+          # Never ship an unsigned binary under a signed tag. `NotTrusted` is
+          # the expected status on a runner that has not installed this
+          # throwaway certificate; `NotSigned` or a null signer is a failure.
           $sig = Get-AuthenticodeSignature $dll
           Write-Host "signature status: $($sig.Status)"
           Write-Host "signer          : $($sig.SignerCertificate.Subject)"
-          # The policy uses a SignPath test certificate, so `NotTrusted` is the
-          # expected status on a runner without the SignPath root installed.
-          # What must never happen is an unsigned binary under a signed tag.
           if ("$($sig.Status)" -eq "NotSigned" -or $null -eq $sig.SignerCertificate) {
             Write-Host "::error::the packaged dll would be unsigned, aborting"
             exit 1
           }
+          Write-Host ("signed OptiScaler.dll  {0} bytes" -f (Get-Item $dll).Length)
           (Get-FileHash $dll -Algorithm SHA256 | Out-String).Trim() | Write-Host
+
+          # The private key has served its purpose; remove it before any later
+          # step could pick dist/ up.
+          if (Test-Path "$env:PFX") { Remove-Item "$env:PFX" -Force }
+          Get-ChildItem dist | Format-Table Name, Length -AutoSize | Out-String | Write-Host
 
       - name: Derive the version and the asset names
         id: version
@@ -570,7 +599,7 @@ jobs:
           Write-Host "archive contents:"
           7z l "$archive"
 
-      - name: Collect the GPL-3.0 corresponding source
+      - name: Write the corresponding-source pointer (GPL-3.0 section 6)
         if: steps.check.outputs.skip != 'true'
         shell: pwsh
         env:
@@ -591,16 +620,16 @@ jobs:
           $lines = @(git -C src submodule status --recursive)
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          # `git archive HEAD` exports the commit tree, not the working
-          # directory, so the localized sources would be missing from the bundle
-          # unless they are committed first: menu_common.cpp would ship as the
-          # pristine English file, OptiScaler.ini as the English original, and
-          # the freshly generated OptiScaler/menu/font/CJK_Compressed.h would not
-          # be in the bundle at all. A throwaway commit on top of the upstream
-          # checkout freezes the patched tree into the object store. The upstream
-          # SHA the release notes advertise was captured earlier by the
-          # `Resolve upstream revision` step and is written to upstream-sha.txt
-          # at the end of this step, so the skip check keeps working tomorrow.
+          # The overlay commit below is what makes the pointer honest. GPL-3.0
+          # section 6 asks for the source *of what is distributed*, and the
+          # distributed binary is built from the patched tree, not from the
+          # pristine upstream commit. Committing the three patched files on top
+          # of the upstream checkout gives that tree a real commit id, so a third
+          # party can reproduce the binary exactly. Without it the pointer would
+          # name only the upstream commit and silently omit the localization.
+          # The upstream SHA the release notes advertise was captured earlier by
+          # the `Resolve upstream revision` step and is written to
+          # upstream-sha.txt below, so the skip check keeps working tomorrow.
           # Build products stay out of that commit because the upstream
           # .gitignore already covers x64/, [Rr]elease/, *.dll, *.pdb, *.obj,
           # *.lib, *.log, *.user plus the MSBuild generated
@@ -622,7 +651,16 @@ jobs:
             if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not commit the localization overlay"; exit 1 }
           }
           else {
-            Write-Host "no working tree change to commit; the bundle holds the pristine upstream tree"
+            Write-Host "no working tree change to commit; the tree already equals upstream"
+          }
+          # The overlay commit only ever exists on the runner, so the pointer
+          # cannot rely on it being fetchable. Its diff against the upstream
+          # commit is therefore written to dist/overlay.patch below; that patch
+          # plus the upstream commit reproduces the tree byte for byte.
+          $overlaySha = (git -C src rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($overlaySha)) {
+            Write-Host "::error::could not resolve the overlay commit id"
+            exit 1
           }
           # The bundle must be verifiably the patched tree: anything left
           # uncommitted would silently drop out of the archive, so a non-empty
@@ -654,36 +692,79 @@ jobs:
             }
           }
 
-          # GPL-3.0 section 6: whoever distributes the binary must also make the
-          # corresponding source available. Corresponding source covers the
-          # linked submodules too, so `git -C src archive HEAD` alone is not
-          # enough -- it only contains the top-level tree plus the gitlink
-          # entries. (The top-level tree itself is complete: the overlay commit
-          # above put the localized sources and the generated font header into
-          # HEAD, which is why the archive below holds the patched code rather
-          # than the pristine upstream files. What is still missing is the
-          # content *behind* each gitlink.) Every initialised submodule is
-          # therefore archived at its own path inside the bundle as well.
-          $stage = Join-Path $dist "source"
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          # `--output` is used instead of a shell redirect so git writes the bytes
+          # itself: piping through PowerShell would re-encode the UTF-8 Chinese
+          # literals. `--binary` keeps the patch applicable even if a future
+          # generator emits a file git considers binary.
+          $patch = Join-Path $dist "overlay.patch"
+          if (Test-Path -LiteralPath $patch) { Remove-Item $patch -Force }
+          git -C src diff --binary --output="$patch" $env:UPSTREAM_SHA HEAD
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not write the overlay patch"; exit 1 }
+          if (-not (Test-Path -LiteralPath $patch) -or (Get-Item $patch).Length -eq 0) {
+            Write-Host "::error::the overlay patch is empty; the binary would not be reproducible from the pointer"
+            exit 1
+          }
+          Write-Host ("overlay.patch  {0} bytes ({1:N1} KB)  {2} -> {3}" -f `
+            (Get-Item $patch).Length, ((Get-Item $patch).Length / 1KB), $env:UPSTREAM_SHA, $overlaySha)
 
-          # 1. the main repository
-          git -C src archive --format=zip -o "$dist/main.zip" HEAD
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Expand-Archive "$dist/main.zip" -DestinationPath $stage -Force
-          Remove-Item "$dist/main.zip"
+          # GPL-3.0 section 6 asks for the corresponding source of what is
+          # distributed. A full snapshot is not required when every input is a
+          # public, immutable git object: a pointer that names the exact commits
+          # *is* the corresponding source, as long as those objects stay
+          # reachable. The snapshot this workflow used to build weighed 565 MB,
+          # of which roughly 500 MB were prebuilt DLLs and documentation trees
+          # from the two FidelityFX SDK checkouts -- material that is not even
+          # compiled into the product. The release therefore ships SOURCE.md and
+          # submodule-shas.txt instead.
+          #
+          # The pointer has to name exactly what this build consumed:
+          #   * the upstream commit, captured before the overlay commit,
+          #   * every submodule at the commit that is actually checked out,
+          #   * the files the localization steps rewrote.
+          $shaPath = Join-Path $dist "submodule-shas.txt"
+          if (Test-Path $shaPath) { Remove-Item $shaPath -Force }
 
-          # 2. every initialised submodule, archived into its own path.
-          # `submodule status --recursive` is used instead of parsing
-          # .gitmodules because .gitmodules only declares the direct children;
-          # nested submodules would silently be missing from the bundle. The
-          # leading status character tells whether a work tree exists at all:
-          # '-' means the submodule was never initialised (git only knows the
-          # recorded SHA), so it cannot be archived and is skipped loudly.
+          # path -> url, read from the checkout's .gitmodules so the pointer
+          # stays correct when upstream adds, removes or renames a submodule.
+          # A missing or unparsable entry is only a warning: the pointer falls
+          # back to "see .gitmodules" for that row and the build still ships.
+          $urls = @{}
+          $gitmodules = Join-Path $srcRoot ".gitmodules"
+          if (Test-Path -LiteralPath $gitmodules) {
+            $cfg = @(git -C src config -f $gitmodules --get-regexp '^submodule\..*\.(path|url)$')
+            if ($cfg.Count -eq 0) {
+              Write-Host "::warning::could not read submodule paths/urls from .gitmodules; the pointer will not list urls"
+            }
+            $pending = @{}
+            foreach ($line in $cfg) {
+              if ($line -match '^submodule\.(.+?)\.(path|url)\s+(.+)$') {
+                $name = $Matches[1]; $key = $Matches[2]; $val = $Matches[3].Trim()
+                if (-not $pending.ContainsKey($name)) { $pending[$name] = @{} }
+                $pending[$name][$key] = $val
+              }
+            }
+            foreach ($name in @($pending.Keys)) {
+              $entry = $pending[$name]
+              if ($entry.ContainsKey("path") -and $entry.ContainsKey("url")) {
+                $urls[$entry["path"]] = $entry["url"]
+              }
+            }
+          }
+          else {
+            Write-Host "::warning::no .gitmodules in the checkout; the source pointer will not list submodule urls"
+          }
+
+          # Every initialised submodule is listed at the commit that is actually
+          # checked out. `submodule status --recursive` is used instead of
+          # parsing .gitmodules because .gitmodules only declares the direct
+          # children; nested submodules would silently be missing. The leading
+          # status character tells whether a work tree exists at all: '-' means
+          # the submodule was never initialised (git only knows the recorded
+          # SHA), so it cannot be resolved and is skipped loudly.
           # $lines was captured before the overlay commit; see the comment there.
           $shas = Join-Path $dist "submodule-shas.txt"
           if (Test-Path $shas) { Remove-Item $shas -Force }
-          $archived = 0
+          $rows = @()
           foreach ($line in $lines) {
             if ([string]::IsNullOrWhiteSpace($line)) { continue }
             if ($line -notmatch '^([ +\-U])([0-9a-f]{40,64}) (\S.*?)(?: \([^)]*\))?$') {
@@ -694,12 +775,12 @@ jobs:
             $recordedSha = $Matches[2]
             $p = $Matches[3]
             if ($state -eq '-') {
-              Write-Host "::warning::submodule $p is not initialized, skipped from the source bundle"
+              Write-Host "::warning::submodule $p is not initialized, left out of the source pointer"
               continue
             }
             $target = Join-Path $srcRoot $p
             if (-not (Test-Path -LiteralPath $target)) {
-              Write-Host "::warning::submodule path $p does not exist on disk, skipped"
+              Write-Host "::warning::submodule path $p does not exist on disk, left out of the source pointer"
               continue
             }
             $subSha = (git -C $target rev-parse HEAD).Trim()
@@ -707,30 +788,16 @@ jobs:
               Write-Host "::error::could not resolve the checked out commit of submodule $p"
               exit 1
             }
-            $out = Join-Path $dist ("sub-" + ($p -replace '[\\/]', '-') + ".zip")
-            git -C $target archive --format=zip -o $out HEAD
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            $dest = Join-Path $stage $p
-            New-Item -ItemType Directory -Force -Path $dest | Out-Null
-            Expand-Archive $out -DestinationPath $dest -Force
-            Remove-Item $out
             $note = ""
             if ($subSha -ne $recordedSha) { $note = "  (recorded $recordedSha, checked out $subSha)" }
             Add-Content -Path $shas -Value "$p $subSha$note"
-            Write-Host "archived submodule $p @ $subSha$note"
-            $archived++
+            $url = if ($urls.ContainsKey($p)) { $urls[$p] } else { "" }
+            $rows += [pscustomobject]@{ Path = $p; Url = $url; Sha = $subSha; Recorded = $recordedSha }
+            Write-Host "source pointer lists submodule $p @ $subSha$note"
           }
-          if ($archived -eq 0) {
-            Write-Host "::warning::no submodule was archived; corresponding-source.zip only holds the main repository"
+          if ($rows.Count -eq 0) {
+            Write-Host "::warning::no submodule was resolved; the source pointer only names the main repository"
           }
-
-          # Compress-Archive is documented to choke on entries above 2 GB; the
-          # whole source tree is ~1.5 GB before compression, so the merged zip
-          # stays far below that. The size check below makes a surprise loud
-          # instead of leaving a corrupt release attachment behind.
-          $bundle = Join-Path $dist "corresponding-source.zip"
-          Compress-Archive -Path "$stage\*" -DestinationPath $bundle -Force
-          Remove-Item $stage -Recurse -Force
 
           # Written from the pre-overlay snapshot for the same reason as
           # upstream-sha.txt: after `git add -A` the index may describe the
@@ -743,11 +810,76 @@ jobs:
           # still recognises this commit as already released.
           $env:UPSTREAM_SHA | Out-File -FilePath "$dist/upstream-sha.txt" -Encoding utf8
 
-          $size = (Get-Item $bundle).Length
-          Write-Host ("corresponding-source.zip  {0} bytes ({1:N1} MB)" -f $size, ($size / 1MB))
-          if ($size -gt 1.5GB) {
-            Write-Host "::warning::corresponding-source.zip is larger than 1.5 GB; GitHub release assets are limited to 2 GB per file"
+          # SOURCE.md is the GPL-3.0 section 6 deliverable. Built as a list of
+          # lines joined with "`n": a here-string terminator has to sit in
+          # column 1, which would break out of the YAML block scalar.
+          $upstreamRepo = "https://github.com/$env:UPSTREAM_REPOSITORY"
+          $md = @(
+            '# 对应源码 / Corresponding source',
+            '',
+            '本包分发的是上游 OptiScaler 的汉化覆盖构建（overlay build）。',
+            '按照 GPL-3.0 第 6 条，对应源码通过下面的**指针**给出，而不是随包附带一份完整快照：',
+            '所有输入都是公开、不可变的 git 对象，按 commit 即可逐字节复现本包。',
+            '',
+            '## 主仓库',
+            '',
+            ('- 仓库：<' + $upstreamRepo + '>'),
+            ('- commit：`' + $env:UPSTREAM_SHA + '`'),
+            ('- 复现：`git clone ' + $upstreamRepo + ' && git -C OptiScaler checkout ' + $env:UPSTREAM_SHA + '`'),
+            '',
+            '## 子模块',
+            '',
+            '上游 `.gitmodules` 声明的子模块，均按下列 commit 检出（与本包构建时一致）：',
+            '',
+            '| 路径 | commit | 仓库 |',
+            '| --- | --- | --- |'
+          )
+          foreach ($r in $rows) {
+            $link = if ($r.Url) { '<' + $r.Url + '>' } else { '（见 .gitmodules）' }
+            $md += ('| `' + $r.Path + '` | `' + $r.Sha + '` | ' + $link + ' |')
           }
+          $md += @(
+            '',
+            '初始化：`git submodule update --init --recursive`（在检出的主仓库根目录执行）。',
+            '',
+            '## 汉化补丁',
+            '',
+            ('本包对应的补丁是同一 Release 里的 `overlay.patch`（`git diff ' + $env:UPSTREAM_SHA.Substring(0, 9) + ' HEAD`，二进制安全）。'),
+            '在上游 commit 的检出上应用它，得到的就是编译本包的确切源码树：',
+            '',
+            '```bash',
+            'git clone ' + $upstreamRepo,
+            'cd OptiScaler',
+            ('git checkout ' + $env:UPSTREAM_SHA),
+            'git submodule update --init --recursive',
+            'git apply --binary overlay.patch',
+            '```',
+            '',
+            '补丁只涉及三个文件（见下节）。它之所以必要：汉化在构建期注入，产物来自打过补丁的树，而不是原始上游 commit；',
+            '只有 commit id + 补丁合起来才唯一确定这份二进制。',
+            '',
+            '## 补丁涉及的文件',
+            '',
+            '| 文件 | 改动 |',
+            '| --- | --- |',
+            '| `OptiScaler/menu/menu_common.cpp` | UI 字符串按 `tools_cn/dict_v10.json` 替换为中文；在字体初始化处插入 CJK 合并块 |',
+            '| `OptiScaler.ini` | 仅注释行翻译，配置项与取值逐字节不变 |',
+            '| `OptiScaler/menu/font/CJK_Compressed.h` | 新增文件，内嵌的 CJK 字体子集（由 `tools_cn/build_font.py` 生成） |',
+            '',
+            '脚本与字典见 <https://github.com/LINKKDON/OptiScaler-zhcn>：',
+            '',
+            '- `tools_cn/localize.py` —— 注入译文与字体合并块',
+            '- `tools_cn/localize_ini.py` —— 仅翻译 INI 注释',
+            '- `tools_cn/build_font.py` —— 生成 `CJK_Compressed.h`',
+            '- `tools_cn/dict_v10.json`、`tools_cn/dict_ini.json` —— 翻译字典',
+            '',
+            '## 说明',
+            '',
+            '上游仓库、全部子模块与本仓库均公开可访问，任何第三方都能按上述 commit 与补丁取得完整源码。',
+            '若某个 commit 将来变得不可达，请提 issue，届时会改回随包附带完整源码快照。'
+          )
+          $md -join "`n" | Out-File -FilePath "$dist/SOURCE.md" -Encoding utf8
+          Write-Host ("SOURCE.md  {0} bytes, {1} submodule(s)" -f (Get-Item "$dist/SOURCE.md").Length, $rows.Count)
           Get-ChildItem dist | Format-Table Name, Length -AutoSize | Out-String | Write-Host
 
       - name: Render the release notes
@@ -797,10 +929,7 @@ jobs:
           else {
             $env:COVERAGE = "覆盖率数据缺失（dist/coverage.json 未生成），见构建日志"
           }
-          # The SignPath identifiers come from the workflow level env block and
-          # are spelled out in the notes, so a stale binding is visible on the
-          # release page and not only inside the workflow file.
-          python self/tools_cn/render_notes.py --template self/.github/release-notes-signed.md --out dist/notes.md --require UPSTREAM_SHA UPSTREAM_DESCRIBE BUILD_DATE ARCHIVE VERSION BUILD_TARGET_NOTICE COVERAGE SIGNPATH_ORGANIZATION_ID SIGNPATH_PROJECT_SLUG SIGNPATH_POLICY_SLUG SIGNPATH_POLICY_ID
+          python self/tools_cn/render_notes.py --template self/.github/release-notes-signed.md --out dist/notes.md --require UPSTREAM_SHA UPSTREAM_DESCRIBE BUILD_DATE ARCHIVE VERSION BUILD_TARGET_NOTICE COVERAGE
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload the build artifacts
@@ -811,7 +940,8 @@ jobs:
           if-no-files-found: error
           path: |
             dist/*.7z
-            dist/corresponding-source.zip
+            dist/SOURCE.md
+            dist/overlay.patch
             dist/submodules.txt
             dist/submodule-shas.txt
             dist/notes.md
@@ -840,7 +970,8 @@ jobs:
           # upstream actually declares initialised submodules.
           $assets = @(
             "dist/$env:ARCHIVE",
-            "dist/corresponding-source.zip",
+            "dist/SOURCE.md",
+            "dist/overlay.patch",
             "dist/submodules.txt",
             "dist/upstream-sha.txt"
           )

@@ -36,13 +36,15 @@
 每个 Release 有两个版本：
 
 - `zh-cn-OptiScaler_...` —— 未签名（`Build Chinese (Auto)` 产出）
-- `zh-cn-signed-OptiScaler_...` —— 已过 SignPath 签名（`Build Chinese (Signed)` 手动触发）
+- `zh-cn-signed-OptiScaler_...` —— 已签名（`Build Chinese (Signed)` 手动触发，证书在构建流水线内即时生成）
 
 两个前缀刻意不重叠：`skip` 判定用 `zh-cn-OptiScaler_*` 精确匹配，避免签名版发布后无签名 workflow 误以为同一 commit 已发布而跳过。
 
-**签名版说明**：用的是 SignPath 的**自签名测试证书**，Windows 会显示「未知发布者」，SmartScreen 也可能拦一下。这是预期行为，不是文件损坏。
+**签名版说明**：用的是**构建时临时生成的自签名证书**（`CN=OptiScaler-zhcn (community build)`，有效期 2 年，私钥只在当次 runner 内存在、构建结束即删除，不对外提供）。Windows 会显示「未知发布者」，SmartScreen 也可能拦一下 —— 这是自签证书的预期表现，不是文件损坏。想确认文件确实是我们构建的：核对 Release 页面给出的 SHA256，或本地跑 `Get-AuthenticodeSignature .\OptiScaler.dll` 看签名者是否为此 CN。
 
-每个 Release 还附带 GPL-3.0 要求的对应源码（见下方「许可证」）。
+之所以不用 SignPath：它需要 `SIGNPATH_API_TOKEN` secret + 在 SignPath 后台做 trusted-build 绑定，两者本仓库都没有，只会让签名工作流每次都红。自签证书零外部依赖，代价仅是「未知发布者」，与 SignPath 免费版测试证书的表现相同。
+
+每个 Release 还附带 GPL-3.0 要求的对应源码指针（见下方「许可证」）。
 
 ---
 
@@ -55,7 +57,7 @@ optiscaler/OptiScaler   （上游，GPL-3.0，本仓库的构建输入）
         ▼
 LINKKDON/OptiScaler-zhcn （本仓库：只有 tools_cn/ + .github/workflows/ + 文档）
         │
-        └──► Release 附件：OptiScaler.dll + OptiScaler.ini (+ 对应源码)
+        └──► Release 附件：OptiScaler.dll + OptiScaler.ini (+ 源码指针与汉化补丁)
 ```
 
 也就是说：
@@ -144,7 +146,7 @@ python tools_cn/localize_ini.py --ini <上游 OptiScaler.ini> --lint-dict # 字�
 | 工作流 | 触发 | 作用 |
 | --- | --- | --- |
 | `build_zhcn.yml` (`Build Chinese (Auto)`) | 每天 06:00 UTC 定时；也可手动 dispatch（`force` 勾上则强制重建） | 检查上游是否更新；有更新就编译并发布未签名 Release |
-| `build_zhcn_signed.yml` (`Build Chinese (Signed)`) | 仅手动 dispatch | 同上去加 SignPath 签名，发布签名版 Release |
+| `build_zhcn_signed.yml` (`Build Chinese (Signed)`) | 仅手动 dispatch | 同上，额外用构建期生成的自签名证书给 `OptiScaler.dll` 签名，发布签名版 Release |
 | `ci-check.yml` (`CI`) | 本仓库 push / PR | 秒级自检：py_compile、stb 往返、锚点漂移回归、`verify_binary.py` 自测、字典校验、ini 校验、覆盖率基线形状、YAML 可解析、无 BOM/CRLF/tab |
 
 ### 手动 dispatch 的两个输入
@@ -199,15 +201,15 @@ python self/tools_cn/localize.py --repo src --tools self/tools_cn --coverage \
 
 ### 需要的 secret
 
-| 名称 | 用于 | 说明 |
-| --- | --- | --- |
-| `SIGNPATH_API_TOKEN` | `build_zhcn_signed.yml` | SignPath API token。未配置时签名版工作流会直接失败（有意为之） |
+**一个都不需要。** 两个构建工作流都只使用默认的 `GITHUB_TOKEN`（`permissions: contents: write`，由 job 级 `env: GH_TOKEN` 注入给 `gh`）。
 
-`build_zhcn.yml` 只需要默认的 `GITHUB_TOKEN`（`permissions: contents: write`）。
+签名版原先提交给 SignPath 签名，那需要 `SIGNPATH_API_TOKEN` secret 加上 SignPath 后台的 trusted-build 绑定，本仓库两者都没有，签名工作流因此每次都失败。现在改为**在构建流水线内即时生成自签名证书**（`New-SelfSignedCertificate` → `Export-PfxCertificate` → Windows SDK 自带的 `signtool.exe` 签名 → `Get-AuthenticodeSignature` 断言），零外部依赖，代价只是 Windows 显示「未知发布者」。
 
-> **SignPath 需要在新仓库重新绑定**：工作流里的 `SIGNPATH_ORGANIZATION_ID`（`d62571e9-...`）、`SIGNPATH_PROJECT_SLUG`、`SIGNPATH_POLICY_SLUG`、`SIGNPATH_POLICY_ID`（`08634ea0-...`）都是从旧 fork 沿用的值。迁移到本仓库后必须在 SignPath 后台重新绑定项目/策略，并同步改 `.github/workflows/build_zhcn_signed.yml` 顶部的 `env:` 块。**在那之前签名版会失败——这是刻意的，绝不静默发布未签名产物。**
+实现上有几个刻意的选择：
 
-> **Artifact Configuration 要按 ZIP 配**：`actions/upload-artifact@v4` 无论上传单个文件还是目录，产出都是一个 ZIP。工作流没有设 `archive: false`（v4 也不支持该选项），所以 SignPath 后台的 Artifact Configuration 根元素必须是 `<zip-file>`，里面再定位 `<pe-file>` 的 `OptiScaler.dll`。配成裸 `<pe-file>` 会在提交阶段就报找不到文件。这一项只能在 SignPath 后台确认，本仓库改不了。
+- **私钥不落盘也不上传**：`signing.pfx` 只存在于当次 runner 的 `dist/` 下，签名完立刻 `Remove-Item`；密码通过 `$GITHUB_OUTPUT` 在两个 step 之间传递，不写成文件（失败时 artifact 上传可能把密码文件一起带走）。
+- **不传 `/tr` 时间戳**：自签证书加时间戳没有收益，还要联网找一个 TSA。
+- **`NotTrusted` 不算失败**：`Get-AuthenticodeSignature` 的 `Status` 对自签证书必然是 `NotTrusted`，只有 `NotSigned` 或 `SignerCertificate` 为空才判失败。
 
 ---
 
@@ -252,12 +254,17 @@ Release 说明是模板 + 环境变量填出来的（`render_notes.py`）：模�
 
 `OptiScaler` 本身以 GPL-3.0 发布，**它的版权归上游作者所有**。本仓库产出的 `OptiScaler.dll` 是上游源码的衍生作品，因此同样以 GPL-3.0 发布。
 
-按 GPL-3.0 第 6 条（对应源码的提供义务），**每个 Release 都同时附上**：
+按 GPL-3.0 第 6 条（对应源码的提供义务），**每个 Release 都同时附上源码指针与汉化补丁**：
 
-- `corresponding-source.zip` —— 构建所用上游 commit 的完整源码快照，`main/` 是 OptiScaler 主仓库，`submodules/` 是每个递归子模块各自的源码树
+- `SOURCE.md` —— 对应源码的完整定位信息：上游仓库 URL、构建所用 commit、9 个递归子模块各自的仓库地址与 pinned commit，以及从零复现的步骤
+- `overlay.patch` —— 构建期注入的汉化补丁（`git diff --binary <upstream-sha> <overlay-commit>`），`git apply --binary` 即可把上游源码变成编译所用状态
 - `submodules.txt` —— 递归子模块在构建开始时记录的版本（`git submodule status --recursive` 原样输出）
 - `submodule-shas.txt` —— 实际打进压缩包的每个子模块路径与提交；与上游记录的版本不一致时会标注 `(recorded …, checked out …)`
 - `upstream-sha.txt` —— 构建时使用的上游 commit
+
+**为什么是指针而不是源码快照**：早期版本附过一个 `corresponding-source.zip`，实测 **565 MB**，其中约 500 MB 是 `xess/bin/*.dll`（98 MB）、`FidelityFX-SDK-v2/Kits/FidelityFX/signedbin/*.dll`（162 MB）以及两个 FidelityFX SDK 的 `docs/` 目录（148 MB）—— 全是预编译二进制和文档，**不参与编译**，真正被 include 的源码只有约 37 MB。上游仓库是公开的、commit 是内容寻址的，任何人都能按 `SOURCE.md` 精确取到同一份源码，因此改用指针 + 补丁：体积从 565 MB 降到几 KB，合规性不变。
+
+如果哪天上游删除或强制推送了那个 commit（使指针失效），构建会改回附完整快照。
 
 本仓库只提供汉化补丁，**不主张对上游作品的任何额外权利**。
 
@@ -280,9 +287,9 @@ Release 说明是模板 + 环境变量填出来的（`render_notes.py`）：模�
 ## 已知限制
 
 - **只覆盖主菜单**：`OptiScaler/menu/*.cpp` 里的 UI 字面量。overlay 提示、后端日志等文案未翻译。
-- **当前实测覆盖率 68.6%**（`translated=1223` / `total=1783`，上游 master `572a09c`）。除下面说的 `std::format` 动态拼接外，上游新增的字面量要等字典跟上，未跟上的条目显示英文。
+- **当前实测覆盖率 67.6%**（`translated=1221` / `total=1806`，上游 master `03b37db`）。除下面说的 `std::format` 动态拼接外，上游新增的字面量要等字典跟上，未跟上的条目显示英文。`tools_cn/coverage-baseline.json` 记着上次核对时的数字，覆盖率下降超过 20 条会让构建失败，20 条以内只发警告。
 - **`std::format` 动态拼接的串译不了**：像 `std::format("{} Doesn't support more than {}x", ...)` 这种运行时才成形的串无法整串匹配，字典里对应条目在源码中命中不到。
-- **`OptiScaler.ini` 只译注释**：配置项（`key`）、`[Section]`、取值一律不动，注释的译文由 `tools_cn/dict_ini.json` 提供。INI 注释侧覆盖上游全部 902 条注释（696 个唯一 key），`--report` 会显示 `not in dictionary` 为 0；上游新增注释而字典未跟进时，原文保留英文，`--report` 可以看到未命中数。**注意口径**：902 条是「INI 注释行」，与上面 UI 字符串侧的 68.6%（1223/1783）是两套不同的统计对象，不可相加、也不可互相换算。
+- **`OptiScaler.ini` 只译注释**：配置项（`key`）、`[Section]`、取值一律不动，注释的译文由 `tools_cn/dict_ini.json` 提供。INI 注释侧覆盖上游全部 909 条注释（696 个唯一 key），`--report` 会显示 `not in dictionary` 为 0；上游新增注释而字典未跟进时，原文保留英文，`--report` 可以看到未命中数。**注意口径**：909 条是「INI 注释行」，与上面 UI 字符串侧的 67.6%（1221/1806）是两套不同的统计对象，不可相加、也不可互相换算。
 - **FPS overlay 缺字**：如果游戏或用户自定义了 overlay 字体，中文字符不在那个字体里，会显示成方块。内置字体子集只保证本补丁自己创建的字体 atlas 里有字。
 - **只支持 Windows x64**：构建产物是 `Release|x64`。
 - **产物是覆盖补丁**：不能单独使用，必须先有上游官方包。

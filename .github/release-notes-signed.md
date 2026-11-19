@@ -3,14 +3,17 @@ OptiScaler 简体中文汉化补丁（社区非官方，**已签名**版本）�
 本压缩包是一个**覆盖补丁**，不是完整安装包。解压后把里面的两个文件放进已经在使用的
 OptiScaler 安装目录（即上游官方包解压后的那个目录）覆盖同名文件即可：
 
-* `OptiScaler.dll` —— 已注入中文菜单与内嵌 CJK 字体子集，并已通过 SignPath 签名
+* `OptiScaler.dll` —— 已注入中文菜单与内嵌 CJK 字体子集，并已用自签名证书签名
 * `OptiScaler.ini` —— 配置项与上游完全一致，只有注释被翻译成中文
 
 覆盖前请先备份原文件。
 
-> **签名说明**：本产物使用 SignPath 的自签名测试证书，Windows 会显示「未知发布者」，
-> SmartScreen 也可能拦截。这是预期行为，不是文件损坏。如果需要受信任的签名，
-> 请自行提交 VirusTotal 检验，或使用未签名的 `zh-cn-` 版本。
+> **签名说明**：本产物使用构建流水线内**即时生成的自签名代码签名证书**
+> （`CN=OptiScaler-zhcn (community build)`，有效期 2 年，仅用于本次构建，不对外提供私钥）。
+> Windows 会显示「未知发布者」，SmartScreen 也可能拦截 —— 这是自签名证书的预期行为，
+> 不是文件损坏。若要确认文件完整性，请核对 Release 里的 SHA256，或用
+> `Get-AuthenticodeSignature` 查看签名者。如需受信任的签名，可自行用 `signtool` 重签，
+> 或改用未签名的 `zh-cn-OptiScaler_*` 版本。
 
 {{BUILD_TARGET_NOTICE}}
 
@@ -35,30 +38,38 @@ upstream-version: {{UPSTREAM_DESCRIBE}}
 条目会退回英文，所以这个数字会随上游漂移；构建脚本会在它相对基线一次掉超过 20 条时
 直接失败，掉 1–20 条时只报警。
 
-## SignPath 配置 / SignPath configuration
+## 签名 / Signature
 
 | 项目 | 值 |
 | --- | --- |
-| organization-id | `{{SIGNPATH_ORGANIZATION_ID}}` |
-| project-slug | `{{SIGNPATH_PROJECT_SLUG}}` |
-| signing-policy | `{{SIGNPATH_POLICY_SLUG}}` |
-| signing-policy-id | `{{SIGNPATH_POLICY_ID}}` |
+| 证书 | 构建期自签名，`CN=OptiScaler-zhcn (community build)` |
+| 用途 | Code Signing（`1.3.6.1.5.5.7.3.3`），Digital Signature |
+| 有效期 | 2 年（自本次构建起算） |
+| 私钥 | 仅存在于本次构建的 runner 上，构建结束即销毁 |
 
-> **注意**：上面的 organization id 与 signing policy id 是在旧 fork 仓库上申请的。
-> 迁移到本仓库后必须在 SignPath 后台重新绑定，并同步更新
-> `.github/workflows/build_zhcn_signed.yml` 顶部的 `SIGNPATH_*` 变量。
+签名步骤在 `build_zhcn_signed.yml` 里用 `New-SelfSignedCertificate` + `Export-PfxCertificate`
+生成证书，再用 Windows SDK 自带的 `signtool.exe` 签名，最后用 `Get-AuthenticodeSignature`
+断言签名确实存在（`Status` 不得为 `NotSigned`，`SignerCertificate` 不得为空）。
+`NotTrusted` 是自签名证书在未安装该证书的机器上的预期状态，不判为失败。
 
 ## 许可证 / License
 
 本产物是 OptiScaler 的衍生作品，OptiScaler 以 GNU General Public License v3.0 发布，
-因此本产物同样以 GPL-3.0 发布。按 GPL-3.0 第 6 条，本 Release 同时提供对应源码：
+因此本产物同样以 GPL-3.0 发布。按 GPL-3.0 第 6 条，本 Release 同时提供对应源码的**指针**：
 
-* `corresponding-source.zip` —— 上游 commit `{{UPSTREAM_SHA}}` 的完整源码快照，
-  含 `main/`（本仓库之外的 OptiScaler 主仓库）与 `submodules/`（递归子模块各自的源码）
+* `SOURCE.md` —— 说明如何用下面的 commit 与补丁重建本包的确切源码树（含 9 个子模块的
+  仓库地址与提交），并列出汉化补丁涉及的文件
+* `overlay.patch` —— 从上游 commit 到本包构建所用源码树的完整 diff（`git diff --binary`），
+  在上游 commit 的检出上 `git apply --binary` 即可复现
 * `submodules.txt` —— 递归子模块在构建开始时记录的版本（`git submodule status --recursive` 原样输出）
-* `submodule-shas.txt` —— 实际打进 `corresponding-source.zip` 的每个子模块路径与提交，
+* `submodule-shas.txt` —— 实际参与构建的每个子模块路径与提交，
   若与上游记录的版本不一致会标注 `(recorded …, checked out …)`
 * `upstream-sha.txt` —— 构建时使用的上游 commit
+
+之所以用指针而不是随包附带完整源码快照：本包的全部输入都是公开、不可变的 git 对象，
+按 commit + 补丁即可逐字节复现；而完整快照有 565 MB，其中约 500 MB 是两个 FidelityFX SDK
+子模块里的预编译 DLL 与文档，它们并不参与编译。若将来某个 commit 变得不可达，会改回随包
+附带完整快照。
 
 本仓库自身的脚本与工作流同样以 GPL-3.0 发布。
 许可证全文：<https://www.gnu.org/licenses/gpl-3.0.txt>
