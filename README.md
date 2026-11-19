@@ -147,7 +147,7 @@ python tools_cn/localize_ini.py --ini <上游 OptiScaler.ini> --lint-dict # 字�
 | --- | --- | --- |
 | `build_zhcn.yml` (`Build Chinese (Auto)`) | 每天 06:00 UTC 定时；也可手动 dispatch（`force` 勾上则强制重建） | 检查上游是否更新；有更新就编译并发布未签名 Release |
 | `build_zhcn_signed.yml` (`Build Chinese (Signed)`) | 仅手动 dispatch | 同上，额外用构建期生成的自签名证书给 `OptiScaler.dll` 签名，发布签名版 Release |
-| `ci-check.yml` (`CI`) | 本仓库 push / PR | 秒级自检：py_compile、stb 往返、锚点漂移回归、`verify_binary.py` 自测、字典校验、ini 校验、覆盖率基线形状、YAML 可解析、无 BOM/CRLF/tab |
+| `ci-check.yml` (`CI`) | 本仓库 push / PR | 秒级自检：py_compile、stb 往返、锚点漂移回归、`verify_binary.py` 自测、`verify_signature.py` 自测、字典校验、ini 校验、覆盖率基线形状、YAML 可解析、无 BOM/CRLF/tab |
 
 ### 手动 dispatch 的两个输入
 
@@ -164,7 +164,7 @@ python tools_cn/localize_ini.py --ini <上游 OptiScaler.ini> --lint-dict # 字�
 
 **构建历史 tag 时汉化不完整。** 字典是按 `master` 的措辞写的；历史版本里被上游改过措辞的注释会保留英文原文，`localize_ini.py --report` 会把它们计入 `not in dictionary`。配置项与取值不受影响。Release 说明里会自动加一段中文提示说明这一点。
 
-`ci-check.yml` 共 13 步，全部离线跑（**刻意不 checkout 上游**——那会把每次 push 的 CI 从十几秒拖到几十分钟）。第 13 步只扫本仓库真正发布的路径（`tools_cn/`、`.github/`、`README.md`、`MIGRATION.md`、`LICENSE`、`.gitignore`、`.gitattributes`），不去扫本机的临时工作目录。
+`ci-check.yml` 共 15 步，全部离线跑（**刻意不 checkout 上游**——那会把每次 push 的 CI 从十几秒拖到几十分钟）。第 15 步只扫本仓库真正发布的路径（`tools_cn/`、`.github/`、`README.md`、`MIGRATION.md`、`LICENSE`、`.gitignore`、`.gitattributes`），不去扫本机的临时工作目录。
 
 仓库带 `.gitattributes`（`* text=auto eol=lf`，二进制扩展名标 `binary`），`*.py` / `*.json` / `*.yml` / `*.md` 一律存 LF。就算有人在 CRLF 工作区提交，git 也会在入库时归一化——但别指望它兜底，最后那步扫描才是真正的防线。
 
@@ -191,7 +191,7 @@ python self/tools_cn/localize.py --repo src --tools self/tools_cn --coverage \
 
 **为什么必须在注入之前测**：注入会把源码里的英文 key 换成中文，之后再数「字典能命中多少 key」就不成立了（实测注入后 `translated` 反而涨到 1245、`total` 掉到 1685）。这一点与「注入后再校验」的直觉相反，`localize.py` 里对应位置有注释说明。
 
-`tools_cn/coverage-baseline.json` 是**锚，不是锁**：上游删词导致 `translated` 变小是正常的。人工确认后主动更新这个文件（新 `upstream_sha`、新数字、`note` 写清原因），并在 commit message 里说明。`ci-check.yml` 第 11 步只离线校验这个文件的形状（40 位十六进制 SHA、ISO-8601 时间、正整数、`translated <= total`），不拉上游。
+`tools_cn/coverage-baseline.json` 是**锚，不是锁**：上游删词导致 `translated` 变小是正常的。人工确认后主动更新这个文件（新 `upstream_sha`、新数字、`note` 写清原因），并在 commit message 里说明。`ci-check.yml` 第 13 步只离线校验这个文件的形状（40 位十六进制 SHA、ISO-8601 时间、正整数、`translated <= total`），不拉上游。
 
 **为什么没有 push 触发构建**：改文档、改字典不该触发一次 30 分钟的编译。定时任务会先比对上游 commit，如果 `OptiScaler.dll` 对应的 `upstream-sha` 已经发过 Release 就直接跳过（`skip` 输出 + Step Summary 说明）。
 
@@ -209,7 +209,8 @@ python self/tools_cn/localize.py --repo src --tools self/tools_cn --coverage \
 
 - **私钥不落盘也不上传**：`signing.pfx` 只存在于当次 runner 的 `dist/` 下，签名完立刻 `Remove-Item`；密码通过 `$GITHUB_OUTPUT` 在两个 step 之间传递，不写成文件（失败时 artifact 上传可能把密码文件一起带走）。
 - **不传 `/tr` 时间戳**：自签证书加时间戳没有收益，还要联网找一个 TSA。
-- **`NotTrusted` 不算失败**：`Get-AuthenticodeSignature` 的 `Status` 对自签证书必然是 `NotTrusted`，只有 `NotSigned` 或 `SignerCertificate` 为空才判失败。
+- **`NotTrusted` 不算失败**：`Get-AuthenticodeSignature` 的 `Status` 对自签证书必然是 `NotTrusted`（本机实测是 `UnknownError`，语义相同：证书链终止于不受信任的根），两者都按预期放行；只有 `NotSigned` 或 `SignerCertificate` 为空才判失败。
+- **签名之外还验结构**：`Get-AuthenticodeSignature` 只回答「签名在不在」，且它的 `Status` 是派生属性（文件被改过也可能是非 `NotSigned`）。所以签名后额外跑 `tools_cn/verify_signature.py --pe <dll> --expect-subject "CN=OptiScaler-zhcn (community build)"`：直接解析 PE 的安全目录与 `WIN_CERTIFICATE`，要求证书表存在、`wRevision`/`wCertificateType` 合法、且证书 blob 里确实出现我们的 subject。它不依赖 Windows 信任库，所以在 `ci-check.yml`（ubuntu）里也能用合成映像跑自测。`HashMismatch`（签名后被篡改）与 `NotSupported` 直接判失败。
 
 ---
 
@@ -229,6 +230,7 @@ tools_cn/
   localize_ini.py          只翻译 OptiScaler.ini 的注释行
   render_notes.py          用环境变量填充 Release 说明模板
   verify_binary.py         产物级校验：在编译出的 DLL 里找 UTF-8 中文字节
+  verify_signature.py      产物级校验：解析 PE 安全目录，确认证书表与签名者
   dict_v10.json            C++ 字面量字典（1450 条）
   dict_ini.json            ini 注释字典
   coverage-baseline.json   覆盖率基线（上游 SHA + translated/total），漂移报警的锚

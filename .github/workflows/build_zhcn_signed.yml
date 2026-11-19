@@ -449,6 +449,8 @@ jobs:
         env:
           PFX: ${{ steps.cert.outputs.pfx }}
           PFX_PASSWORD: ${{ steps.cert.outputs.password }}
+          THUMBPRINT: ${{ steps.cert.outputs.thumbprint }}
+          SUBJECT: ${{ env.SIGNING_SUBJECT }}
         run: |
           # The Windows SDK is not on PATH on windows-latest, and the exact
           # version directory changes with the image, so signtool is located by
@@ -483,14 +485,45 @@ jobs:
             exit 1
           }
 
-          # Never ship an unsigned binary under a signed tag. `NotTrusted` is
-          # the expected status on a runner that has not installed this
-          # throwaway certificate; `NotSigned` or a null signer is a failure.
+          # Never ship an unsigned binary under a signed tag.
+          #
+          # Two independent checks, because each catches what the other misses:
+          #
+          # 1. `Get-AuthenticodeSignature` is the authority on *the signature*
+          #    but reports through the trust chain, so a throwaway self-signed
+          #    certificate yields `UnknownError` ("chain terminated in a root
+          #    certificate not trusted") or `NotTrusted` -- neither means
+          #    "unsigned". Also `Status` is a *derived* property: for a file
+          #    whose bytes changed after signing it can still be non-NotSigned.
+          #    So the only statuses treated as fatal are the ones that cannot
+          #    coexist with a present signature.
+          # 2. `verify_signature.py` parses the PE security directory: a missing
+          #    certificate table, a truncated one, or one whose blob does not
+          #    name our subject is a hard failure regardless of trust store.
           $sig = Get-AuthenticodeSignature $dll
           Write-Host "signature status: $($sig.Status)"
+          Write-Host "signature message: $($sig.StatusMessage)"
           Write-Host "signer          : $($sig.SignerCertificate.Subject)"
           if ("$($sig.Status)" -eq "NotSigned" -or $null -eq $sig.SignerCertificate) {
             Write-Host "::error::the packaged dll would be unsigned, aborting"
+            exit 1
+          }
+          # Any status other than the two trust-chain outcomes is suspicious
+          # enough to inspect, but only HashMismatch/NotSupported are fatal.
+          if ("$($sig.Status)" -in @("HashMismatch", "NotSupported")) {
+            Write-Host "::error::signature status $($sig.Status) means the file was modified after signing or the algorithm is unsupported, aborting"
+            exit 1
+          }
+          if ("$($sig.Status)" -notin @("Valid", "UnknownError", "NotTrusted")) {
+            Write-Host "::warning::unexpected signature status $($sig.Status); relying on the structural check below"
+          }
+          if ([string]::IsNullOrEmpty($env:THUMBPRINT)) {
+            Write-Host "::error::the certificate thumbprint was not propagated from the previous step"
+            exit 1
+          }
+          python self/tools_cn/verify_signature.py --pe $dll --expect-subject "$env:SUBJECT"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::the dll carries no authenticode signature from our certificate, aborting"
             exit 1
           }
           Write-Host ("signed OptiScaler.dll  {0} bytes" -f (Get-Item $dll).Length)

@@ -73,6 +73,16 @@ jobs:
           fi
           echo "verify_binary.py self test OK"
 
+      - name: verify_signature.py self test
+        # The Authenticode check itself only runs on the Windows build, against
+        # the real dll. Its PE parser is plain structure reading (DOS header ->
+        # OptionalHeader -> security data directory -> WIN_CERTIFICATE), with no
+        # dependency on the Windows trust store, so it can be pinned here with
+        # synthetic images: a signed image naming the expected subject passes, a
+        # missing or malformed certificate table fails, and a one-character
+        # subject must never be satisfied by random DER bytes.
+        run: python3 tools_cn/verify_signature.py --self-test
+
       - name: Legacy code page stdout guard
         # The Windows build runner hands Python a cp1252 stdout. Every tool in
         # tools_cn prints Chinese on at least one diagnostic path, so a missing
@@ -101,7 +111,8 @@ jobs:
             exit 1
           fi
           # The other tools must at least survive --help under the legacy page.
-          for tool in localize.py localize_ini.py build_font.py render_notes.py; do
+          for tool in localize.py localize_ini.py build_font.py render_notes.py \
+                      verify_binary.py verify_signature.py; do
             python3 "tools_cn/$tool" --help > /dev/null
           done
           echo "legacy code page stdout guard OK"
