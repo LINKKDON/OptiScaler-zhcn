@@ -741,7 +741,7 @@ jobs:
             '在上游 commit 的检出上应用它，得到的就是编译本包的确切源码树：',
             '',
             '```bash',
-            'git clone ' + $upstreamRepo,
+            ('git clone ' + $upstreamRepo),
             'cd OptiScaler',
             ('git checkout ' + $env:UPSTREAM_SHA),
             'git submodule update --init --recursive',
